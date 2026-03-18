@@ -24,10 +24,9 @@ OUTPUT_DIR    = "recordings"       # video output folder name
 
 TRIGGER_LINE       = "Line0"       # GPIO line TTL is wired to
 TRIGGER_ACTIVATION = "RisingEdge"  # RisingEdge or FallingEdge
-TRIGGER_SELECTOR   = "FrameStart"  # FrameStart = one pulse per frame
-                                   # AcquisitionStart = one pulse starts streaming
+TRIGGER_SELECTOR   = "AcquisitionStart" # AcquisitionStart = one pulse starts streaming
 
-GETNEXTIMAGE_TIMEOUT = 5000        # ms — increase if TTL pulses are infrequent
+GETNEXTIMAGE_TIMEOUT = 500        # ms — increase if TTL pulses are infrequent
 
 
 # ---------------------------------------------------------------------------
@@ -46,20 +45,21 @@ class CameraStreamer:
     def __init__(self, cam_list):
         self.cam_list     = cam_list
         self.camera_count = cam_list.GetSize()
-        self._stop_event  = threading.Event()
+        self._stop_event  = threading.Event() # Threading flag
 
-        # Preview path
+        # Preview path, most recent frame
         self.preview_frames = [None] * self.camera_count
         self.preview_locks  = [threading.Lock() for _ in range(self.camera_count)]
 
-        # Writer path
+        # Writer path, stores all frames
         self.writer_queues = [queue.Queue() for _ in range(self.camera_count)]
 
         self._capture_threads = []
         self._writer_threads  = []
 
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        os.makedirs(OUTPUT_DIR, exist_ok=True) # make output directory
 
+        # Configure all cameras and start threads
         self._init_cameras()
         self._start_threads()
 
@@ -91,6 +91,7 @@ class CameraStreamer:
             if PySpin.IsAvailable(node_trigger_selector) and PySpin.IsWritable(
                 node_trigger_selector
             ):
+                # Tells camera which GPIO pin to listen to, TTL cable wired to this
                 node_trigger_selector.SetIntValue(
                     node_trigger_selector.GetEntryByName(TRIGGER_SELECTOR).GetValue()
                 )
@@ -268,7 +269,7 @@ class CameraStreamer:
 
     def _capture_frame(self, index: int, cam):
         while not self._stop_event.is_set():
-            try:
+            try: # Until timeout
                 image_result = cam.GetNextImage(GETNEXTIMAGE_TIMEOUT)
 
                 if image_result.IsIncomplete():
@@ -276,7 +277,7 @@ class CameraStreamer:
                         f"Camera {index}: incomplete image "
                         f"(status {image_result.GetImageStatus()})"
                     )
-                    image_result.Release()
+                    image_result.Release() # release corrupt incomplete frame
                     continue
 
                 # Convert to BGR8 — consistent pixel format for both preview
@@ -309,7 +310,13 @@ class CameraStreamer:
     ) -> subprocess.Popen:
         if not shutil.which("ffmpeg"):
             raise RuntimeError("ffmpeg not found on PATH")
-
+        
+        """
+        libx264 is H.264 software encoding. 
+        preset fast is a speed/compression tradeoff — slower presets produce smaller files at the same quality. 
+        crf 18 is the quality level — 0 is lossless, 51 is worst, 18 is near-lossless visually. 
+        yuv420p is required for broad player compatibility
+        """
         cmd = [
             "ffmpeg",
             "-y",
@@ -326,10 +333,11 @@ class CameraStreamer:
             "-movflags", "+faststart",
             output_path,
         ]
+        
         return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     def _write_frames(self, index: int, serial: str):
-        ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts          = datetime.now().strftime("%Y%m%d_%H%M%S") # timestamp at start of thread
         output_path = os.path.join(OUTPUT_DIR, f"camera_{serial}_{ts}.mp4")
         proc        = None
 
@@ -346,7 +354,7 @@ class CameraStreamer:
                 print(f"Camera {index}: writing to {output_path} at {w}x{h}")
 
             try:
-                proc.stdin.write(frame.tobytes())
+                proc.stdin.write(frame.tobytes()) # converts numpy array to flat bytes object
             except BrokenPipeError:
                 print(f"Camera {index}: ffmpeg pipe broken, restarting writer...")
                 proc = None
@@ -371,20 +379,22 @@ class CameraStreamer:
 
     def _start_threads(self):
         for i, cam in enumerate(self.cam_list):
-            serial = _get_serial(cam, i)
+            serial = _get_serial(cam, i) # Camera's serial number
 
+            # Create capture thread
             ct = threading.Thread(
-                target=self._capture_frame,
-                args=(i, cam),
-                daemon=True,
-                name=f"capture-{i}",
+                target=self._capture_frame, 
+                args=(i, cam), # arguments passed to above func(i = know what queue, cam = know what cam to call GetNextImage)
+                daemon=True, # marks as background thread
+                name=f"capture-{i}", # for debugging
             )
             ct.start()
             self._capture_threads.append(ct)
 
-            wt = threading.Thread(
+            # Creates write thread
+            wt = threading.Thread( 
                 target=self._write_frames,
-                args=(i, serial),
+                args=(i, serial), # Doesn't touch camera, reads from self.writer_queues[i]
                 daemon=True,
                 name=f"writer-{i}",
             )
@@ -401,6 +411,11 @@ class CameraStreamer:
             return self.preview_frames[index]
 
     def stop(self):
+        """
+        Sets the stop event so all threads exit their loops. 
+        Joins writer threads with a 5 second timeout to let them finish flushing — 
+        capture threads are daemons so they don't need joining, they'll die when the main process exits.
+        """
         print("\nStopping acquisition...")
         self._stop_event.set()
 
@@ -429,7 +444,7 @@ def _get_serial(cam, cam_index: int) -> str:
         pass
     return str(cam_index)
 
-
+# Mostly kept from example
 def print_device_info(nodemap, cam_index: int) -> bool:
     print(f"Printing device information for camera {cam_index}...\n")
     try:
