@@ -1,18 +1,21 @@
+# Imports
 import os
 import threading
 import queue
 import numpy as np
 import cv2
 import PySpin
+import subprocess
+import shutil
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-WRITER_FPS = 60.0
+WRITER_FPS = 60.0 # CHANGE ACCORDINGLY
 WRITER_FOURCC = "mp4v"
-OUTPUT_DIR = "recordings"
+OUTPUT_DIR = "recordings" # name of folder where output video will be stored
 
 
 # ---------------------------------------------------------------------------
@@ -121,22 +124,14 @@ class CameraStreamer:
                     image_result.Release()
                     continue
 
-                # Convert to BGR8 so OpenCV/VideoWriter can consume it directly
-                converted = image_result.Convert(
-                    PySpin.PixelFormat_BGR8, PySpin.HQ_LINEAR
-                )
-                frame = converted.GetNDArray()          # numpy array, still Spinnaker memory
-                frame = np.array(frame, copy=True)      # own copy before Release()
+                converted = image_result.Convert(PySpin.PixelFormat_BGR8, PySpin.HQ_LINEAR)
+                frame = np.array(converted.GetNDArray(), copy=True)  # one copy, owns the data
+                image_result.Release()                                # safe — frame is independent
 
-                # Release Spinnaker buffer ASAP — fixed internal buffer, don't starve it
-                image_result.Release()
-
-                # --- Preview path: overwrite slot, never blocks ---
                 with self.preview_locks[index]:
-                    self.preview_frames[index] = frame
+                    self.preview_frames[index] = frame       # preview holds a reference
 
-                # --- Writer path: enqueue a second copy so both paths are independent ---
-                self.writer_queues[index].put(frame.copy())
+                self.writer_queues[index].put(frame)         # writer holds the same reference
 
             except PySpin.SpinnakerException as ex:
                 if not self._stop_event.is_set():
@@ -145,9 +140,6 @@ class CameraStreamer:
     # ------------------------------------------------------------------
     # Writer thread  (one per camera)
     # ------------------------------------------------------------------
-
-    import subprocess
-    import shutil
 
     def _make_ffmpeg_writer(self, output_path: str, width: int, height: int) -> subprocess.Popen:
         """
