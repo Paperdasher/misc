@@ -604,7 +604,7 @@ def print_device_info(nodemap, cam_name: str) -> bool:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def __init__(self, config: dict, system: PySpin.System):
+def __init__(self, config: dict, system: "PySpin.SystemPtr"):
     self.config       = config
     self.system       = system
     self._stop_event  = threading.Event()
