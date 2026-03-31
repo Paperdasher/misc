@@ -24,7 +24,7 @@ roi:
 
 # Hardware TTL trigger
 trigger:
-  enabled: true
+  enabled: false
   line: Line0             # Line0 | Line1 | Line2 | Line3
   activation: RisingEdge  # RisingEdge | FallingEdge
   selector: AcquisitionStart  # AcquisitionStart | FrameStart
@@ -40,7 +40,7 @@ cameras:
     name: "top"
     enabled: true
     master: true
-    exposure_us: 500
+    exposure_us: 30000
 
 #  cam1:
 #    serial: "87654321" # PLACEHOLDER
