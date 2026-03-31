@@ -40,7 +40,7 @@ cameras:
     name: "top"
     enabled: true
     master: true
-    exposure_us: 30000
+    exposure_us: 500
 
 #  cam1:
 #    serial: "87654321" # PLACEHOLDER
