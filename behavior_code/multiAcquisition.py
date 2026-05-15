@@ -41,6 +41,7 @@ class CameraStreamer:
             if cfg.get("enabled", True)
         }
 
+        # Camera properties
         self.camera_count = len(self.cam_configs)
         self.cam_names    = list(self.cam_configs.keys())
         self.cameras: dict[str, PySpin.Camera] = {}
@@ -66,20 +67,24 @@ class CameraStreamer:
             for name in self.cam_names
         }
 
+
         self._capture_threads: list[threading.Thread] = []
         self._writer_threads:  list[threading.Thread] = []
 
+        # Configurations for recording video
         rec = config["recording"]
         self.fps              = rec["fps"]
         self.jpeg_quality     = rec.get("jpeg_quality", 90)
         self.split_size_mb    = rec.get("split_size_mb", None)
 
+        # Configurations for region of interest(roi)
         roi = config.get("roi", {})
         self.target_w = roi.get("width",    None)
         self.target_h = roi.get("height",   None)
         self.offset_x = roi.get("offset_x", 0)
         self.offset_y = roi.get("offset_y", 0)
 
+        # Configuration for triggering start of recording(TTL vs manually)
         trig = config.get("trigger", {})
         self.trigger_enabled    = trig.get("enabled",    False)
         self.trigger_line       = trig.get("line",       "Line0")
@@ -89,11 +94,13 @@ class CameraStreamer:
 
         self.metadata_config = config.get("metadata", {})
 
+        # Creating new experiment folder named the experiment start datetime inside initially chosen folder
         save_dir   = config["save_dir"]
         experiment = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.output_dir = os.path.join(save_dir, experiment)
         os.makedirs(self.output_dir, exist_ok=True)
 
+        # Saves copy of config file in new experiment folder
         with open(os.path.join(self.output_dir, "config.yaml"), "w") as f:
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
@@ -102,7 +109,7 @@ class CameraStreamer:
     # ------------------------------------------------------------------
 
     def get_stats(self, cam_name: str) -> dict:
-        """Return a snapshot of live capture stats for the given camera."""
+        # Return a snapshot of live capture stats for the given camera
         with self._stats_locks[cam_name]:
             s = self._stats[cam_name]
             return {
@@ -112,7 +119,7 @@ class CameraStreamer:
             }
 
     def _update_stats(self, cam_name: str, total_frames: int):
-        """Update rolling FPS and total frame count (called from capture thread)."""
+        # Update rolling FPS and total frame count (called from capture thread)
         now = time.perf_counter()
         with self._stats_locks[cam_name]:
             s = self._stats[cam_name]
@@ -140,16 +147,16 @@ class CameraStreamer:
 
         cfg   = self.metadata_config
         label = self.cam_configs[cam_name].get("name", cam_name)
-        path  = os.path.join(self.output_dir, f"{label}_timestamps.csv")
+        path  = os.path.join(self.output_dir, f"{label}_timestamps.csv") # timestamp by frame csv
 
         f      = open(path, "w", newline="")
         writer = csv.writer(f)
 
         header = []
         if cfg.get("save_framecount", True): header.append("framecount")
-        if cfg.get("save_timestamp",  True): header.append("camera_hardware_timestamp_s")
-        if cfg.get("save_sestime",    True): header.append("sestime_s")
-        if cfg.get("save_cputime",    True): header.append("cpu_wall_clock_s")
+        if cfg.get("save_timestamp",  True): header.append("camera_hardware_timestamp_s") # camera timestamp
+        if cfg.get("save_sestime",    True): header.append("sestime_s") # time elapsed 
+        if cfg.get("save_cputime",    True): header.append("cpu_wall_clock_s") # computer timestamp
 
         writer.writerow(header)
         f.flush()
@@ -158,7 +165,7 @@ class CameraStreamer:
         return f, writer
 
     def _append_metadata(self, writer, framecount, timestamp, sestime, cputime):
-        """Append one per-frame row to the timestamp CSV."""
+        # Append one per-frame row to the timestamp CSV
         if writer is None:
             return
 
@@ -255,6 +262,7 @@ class CameraStreamer:
             for name, cfg in self.cam_configs.items()
         }
 
+        # Go through PySpin node map to obtain serial num of cameras
         for cam in cam_list:
             node = PySpin.CStringPtr(
                 cam.GetTLDeviceNodeMap().GetNode("DeviceSerialNumber")
@@ -321,6 +329,7 @@ class CameraStreamer:
         nodemap = cam.GetNodeMap()
         print(f"\n{cam_name}: configuring...")
 
+        # Pixel format chosen out of Mono8, Mono16, BayerRG8, BGR8
         try:
             node_pixel_format = PySpin.CEnumerationPtr(nodemap.GetNode("PixelFormat"))
             if PySpin.IsAvailable(node_pixel_format) and PySpin.IsWritable(node_pixel_format):
@@ -333,6 +342,7 @@ class CameraStreamer:
             else:
                 print("  Warning: could not set any preferred pixel format")
 
+            # Offset X and Y for ROI
             if self.target_w is not None and self.target_h is not None:
                 node_offset_x = PySpin.CIntegerPtr(nodemap.GetNode("OffsetX"))
                 node_offset_y = PySpin.CIntegerPtr(nodemap.GetNode("OffsetY"))
@@ -367,6 +377,7 @@ class CameraStreamer:
                 sensor_w = node_offset_x.GetMax() + actual_w
                 sensor_h = node_offset_y.GetMax() + actual_h
 
+                # Calculate X and Y center based on offset
                 if PySpin.IsAvailable(node_offset_x) and PySpin.IsWritable(node_offset_x):
                     x_inc    = node_offset_x.GetInc()
                     x_center = (sensor_w - actual_w) // 2
@@ -386,6 +397,7 @@ class CameraStreamer:
             if self.trigger_enabled:
                 self._configure_trigger(nodemap, cam_name)
 
+            # Always choose continuous acquisition
             node_acq_mode = PySpin.CEnumerationPtr(nodemap.GetNode("AcquisitionMode"))
             if PySpin.IsAvailable(node_acq_mode) and PySpin.IsWritable(node_acq_mode):
                 node_continuous = node_acq_mode.GetEntryByName("Continuous")
@@ -403,12 +415,14 @@ class CameraStreamer:
             cam.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
             print('Automatic exposure disabled...')
 
+            # Exposure time no more than 15000us
             cam_cfg = self.cam_configs[cam_name]
             exposure_time_to_set = cam_cfg.get("exposure_us", 14000)
             exposure_time_to_set = min(15000, exposure_time_to_set)
             cam.ExposureTime.SetValue(exposure_time_to_set)
             print('Shutter time set to %s us...\n' % exposure_time_to_set)
 
+            
             cam.GainAuto.SetValue(PySpin.GainAuto_Off)
             gain_to_set = cam_cfg.get("gain_db", 10)
             gain_to_set = min(cam.Gain.GetMax(), gain_to_set)
@@ -874,8 +888,8 @@ def run_setup_wizard(system: "PySpin.SystemPtr", output_path: str = "config.yaml
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
     print(f"\nConfig written to: {os.path.abspath(output_path)}")
-    print("Run acquisition with:  python camera_acquisition.py -c config.yaml\n")
-    print("Open the GUI with:     python config_gui.py -c config.yaml\n")
+    print("Run acquisition with:  python multiAcquisition.py -c config.yaml\n")
+    print("Open the GUI with:     python config.py -c config.yaml\n")
 
 
 # ---------------------------------------------------------------------------

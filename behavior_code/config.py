@@ -1,13 +1,13 @@
 """
-config_gui.py — Camera Acquisition Configuration GUI
+config.py — Camera Acquisition Configuration GUI
 =====================================================
 A PyQt5 interface for loading, editing, and saving camera acquisition configs.
 
 Usage
 -----
-    python config_gui.py                     # opens file browser to pick a config
-    python config_gui.py -c config.yaml      # opens with a specific config
-    python config_gui.py --dir /path/to/dir  # searches that directory for *.yaml files
+    python config.py                     # opens file browser to pick a config
+    python config.py -c config.yaml      # opens with a specific config
+    python config.py --dir /path/to/dir  # searches that directory for *.yaml files
 
 Features
 --------
