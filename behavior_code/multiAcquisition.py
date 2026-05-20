@@ -692,7 +692,7 @@ def draw_stats_overlay(frame: np.ndarray, stats: dict, cam_label: str) -> np.nda
     """
     import cv2
 
-    # Convert to BGR so we can draw coloured text
+    # Convert to BGR for colored text indicating stats
     if frame.ndim == 2:
         display = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
     else:
@@ -709,7 +709,7 @@ def draw_stats_overlay(frame: np.ndarray, stats: dict, cam_label: str) -> np.nda
         f"Buffered : {buffered:>8,}",
     ]
 
-    # Choose text colour: yellow normally, red if buffer is growing large
+    # Yellow normally, red if buffer is growing large
     text_color = (0, 255, 255) if buffered < 50 else (0, 80, 255)
 
     font       = cv2.FONT_HERSHEY_SIMPLEX
@@ -742,6 +742,7 @@ def draw_stats_overlay(frame: np.ndarray, stats: dict, cam_label: str) -> np.nda
 # ---------------------------------------------------------------------------
 
 def print_device_info(nodemap, cam_name: str) -> bool:
+    # Info such as serial num extracted from node of camera
     print(f"\nDevice information for {cam_name}:")
     try:
         node_device_information = PySpin.CCategoryPtr(
@@ -792,11 +793,13 @@ def run_setup_wizard(system: "PySpin.SystemPtr", output_path: str = "config.yaml
     print("  Camera Acquisition — Setup Wizard")
     print("="*60)
 
+    # Find cameras from node map
     devices = get_connected_serials(system)
     if not devices:
         print("No cameras detected. Check USB/GigE connections and drivers.")
         return
 
+    # Print cameras found from node map
     print(f"\nFound {len(devices)} camera(s):\n")
     for i, d in enumerate(devices):
         print(f"  [{i}]  Serial: {d['serial']}   Model: {d['model']}   Vendor: {d['vendor']}")
