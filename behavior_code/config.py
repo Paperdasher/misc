@@ -13,7 +13,8 @@ Features
 --------
   • Browse for / auto-discover YAML configs in the project folder
   • Edit all camera, recording, ROI, trigger and metadata settings
-  • Full experiment + animal metadata panel (experimenter, animal ID, genotype, etc.)
+  • Full experiment + animal metadata panel
+  • Morelia / Pinnacle TTL configuration panel (PC-side polling)
   • Per-camera chamber assignment
   • Live validation (required fields highlighted)
   • Save back to the same file or Save As
@@ -49,6 +50,7 @@ CARD_BG    = "#2b303b"
 ACCENT     = "#4f8ef7"
 ACCENT2    = "#5ecfa8"
 WARN       = "#f7934f"
+AMBER      = "#e8a020"      # used for TTL tab accent
 TEXT_PRI   = "#e8eaf0"
 TEXT_SEC   = "#8a90a0"
 BORDER     = "#363c4a"
@@ -340,33 +342,31 @@ class MetadataTab(QWidget):
         layout.setSpacing(16)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        # ---- Session identity ----
         id_box = QGroupBox("Session Identity")
         id_grid = QGridLayout(id_box)
         id_grid.setSpacing(10)
         id_grid.setColumnStretch(1, 1)
         id_grid.setColumnStretch(3, 1)
 
-        self.experimenter = QLineEdit()
+        self.experimenter    = QLineEdit()
         self.experimenter.setPlaceholderText("e.g. Harley")
         self.experiment_name = QLineEdit()
         self.experiment_name.setPlaceholderText("e.g. Sema6aKD_cohort1")
-        self.session_date = QLineEdit(date.today().strftime("%Y-%m-%d"))
-        self.schedule_name = QLineEdit()
+        self.session_date    = QLineEdit(date.today().strftime("%Y-%m-%d"))
+        self.schedule_name   = QLineEdit()
         self.schedule_name.setPlaceholderText("e.g. FR5_extinction")
 
-        id_grid.addWidget(make_label("Experimenter"),   0, 0)
-        id_grid.addWidget(self.experimenter,            0, 1)
-        id_grid.addWidget(make_label("Experiment Name"),0, 2)
-        id_grid.addWidget(self.experiment_name,         0, 3)
-        id_grid.addWidget(make_label("Date"),           1, 0)
-        id_grid.addWidget(self.session_date,            1, 1)
-        id_grid.addWidget(make_label("Schedule Name"),  1, 2)
-        id_grid.addWidget(self.schedule_name,           1, 3)
+        id_grid.addWidget(make_label("Experimenter"),    0, 0)
+        id_grid.addWidget(self.experimenter,             0, 1)
+        id_grid.addWidget(make_label("Experiment Name"), 0, 2)
+        id_grid.addWidget(self.experiment_name,          0, 3)
+        id_grid.addWidget(make_label("Date"),            1, 0)
+        id_grid.addWidget(self.session_date,             1, 1)
+        id_grid.addWidget(make_label("Schedule Name"),   1, 2)
+        id_grid.addWidget(self.schedule_name,            1, 3)
 
         layout.addWidget(id_box)
 
-        # ---- Animal info ----
         animal_box = QGroupBox("Animal")
         animal_grid = QGridLayout(animal_box)
         animal_grid.setSpacing(10)
@@ -375,9 +375,9 @@ class MetadataTab(QWidget):
 
         self.animal_id = QLineEdit()
         self.animal_id.setPlaceholderText("e.g. M123")
-        self.genotype = QLineEdit()
+        self.genotype  = QLineEdit()
         self.genotype.setPlaceholderText("e.g. WT, HET, KO")
-        self.group = QLineEdit()
+        self.group     = QLineEdit()
         self.group.setPlaceholderText("e.g. control, treatment")
 
         animal_grid.addWidget(make_label("Animal ID"), 0, 0)
@@ -389,8 +389,7 @@ class MetadataTab(QWidget):
 
         layout.addWidget(animal_box)
 
-        # ---- Co-recording paths ----
-        corecord_box = QGroupBox("Co-recordings & Paths")
+        corecord_box  = QGroupBox("Co-recordings & Paths")
         corecord_grid = QGridLayout(corecord_box)
         corecord_grid.setSpacing(10)
         corecord_grid.setColumnStretch(1, 1)
@@ -407,14 +406,12 @@ class MetadataTab(QWidget):
 
         corecord_grid.addWidget(make_label("EEG / Fiber Photometry Path"), 0, 0)
         corecord_grid.addLayout(eeg_row, 0, 1)
-
         layout.addWidget(corecord_box)
 
-        # ---- Notes ----
-        notes_box = QGroupBox("Notes")
+        notes_box    = QGroupBox("Notes")
         notes_layout = QVBoxLayout(notes_box)
-        self.notes = QTextEdit()
-        self.notes.setPlaceholderText("Any session notes, deviations from protocol, animal behaviour observations…")
+        self.notes   = QTextEdit()
+        self.notes.setPlaceholderText("Session notes, deviations, observations…")
         self.notes.setFixedHeight(100)
         notes_layout.addWidget(self.notes)
         layout.addWidget(notes_box)
@@ -427,7 +424,6 @@ class MetadataTab(QWidget):
         if path:
             target.setText(path)
 
-    # ------------------------------------------------------------------
     def load(self, meta: dict):
         self.experimenter.setText(meta.get("experimenter_name", ""))
         self.experiment_name.setText(meta.get("experiment_name", ""))
@@ -456,8 +452,6 @@ class MetadataTab(QWidget):
 # ---------------------------------------------------------------------------
 
 class SingleCameraWidget(QGroupBox):
-    """Editable card for one camera entry."""
-
     def __init__(self, cam_key: str, cfg: dict, parent=None):
         super().__init__(cam_key, parent)
         self.cam_key = cam_key
@@ -466,11 +460,11 @@ class SingleCameraWidget(QGroupBox):
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
 
-        self.serial   = QLineEdit(str(cfg.get("serial", "")))
-        self.name_e   = QLineEdit(str(cfg.get("name", cam_key)))
-        self.chamber  = QLineEdit(str(cfg.get("chamber", "")))
+        self.serial  = QLineEdit(str(cfg.get("serial", "")))
+        self.name_e  = QLineEdit(str(cfg.get("name", cam_key)))
+        self.chamber = QLineEdit(str(cfg.get("chamber", "")))
         self.chamber.setPlaceholderText("e.g. A1, box3")
-        self.enabled  = QCheckBox("Enabled")
+        self.enabled = QCheckBox("Enabled")
         self.enabled.setChecked(cfg.get("enabled", True))
 
         self.exposure = QSpinBox()
@@ -494,24 +488,21 @@ class SingleCameraWidget(QGroupBox):
         self.throughput.setSuffix(" bps")
         self.throughput.setValue(cfg.get("throughput_limit", 90_000_000))
 
-        grid.addWidget(make_label("Serial"),          0, 0)
-        grid.addWidget(self.serial,                   0, 1)
-        grid.addWidget(make_label("Friendly Name"),   0, 2)
-        grid.addWidget(self.name_e,                   0, 3)
-
-        grid.addWidget(make_label("Chamber / Arena"), 1, 0)
-        grid.addWidget(self.chamber,                  1, 1)
-        grid.addWidget(self.enabled,                  1, 2, 1, 2)
-
-        grid.addWidget(make_label("Exposure"),        2, 0)
-        grid.addWidget(self.exposure,                 2, 1)
-        grid.addWidget(make_label("Gain"),            2, 2)
-        grid.addWidget(self.gain,                     2, 3)
-
-        grid.addWidget(make_label("Black Level"),     3, 0)
-        grid.addWidget(self.black_level,              3, 1)
-        grid.addWidget(make_label("Throughput Limit"),3, 2)
-        grid.addWidget(self.throughput,               3, 3)
+        grid.addWidget(make_label("Serial"),           0, 0)
+        grid.addWidget(self.serial,                    0, 1)
+        grid.addWidget(make_label("Friendly Name"),    0, 2)
+        grid.addWidget(self.name_e,                    0, 3)
+        grid.addWidget(make_label("Chamber / Arena"),  1, 0)
+        grid.addWidget(self.chamber,                   1, 1)
+        grid.addWidget(self.enabled,                   1, 2, 1, 2)
+        grid.addWidget(make_label("Exposure"),         2, 0)
+        grid.addWidget(self.exposure,                  2, 1)
+        grid.addWidget(make_label("Gain"),             2, 2)
+        grid.addWidget(self.gain,                      2, 3)
+        grid.addWidget(make_label("Black Level"),      3, 0)
+        grid.addWidget(self.black_level,               3, 1)
+        grid.addWidget(make_label("Throughput Limit"), 3, 2)
+        grid.addWidget(self.throughput,                3, 3)
 
     def dump(self) -> dict:
         return {
@@ -534,7 +525,7 @@ class CamerasTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
-        self._content_w  = QWidget()
+        self._content_w      = QWidget()
         self._content_layout = QVBoxLayout(self._content_w)
         self._content_layout.setSpacing(12)
         self._content_layout.setContentsMargins(20, 20, 20, 20)
@@ -543,18 +534,14 @@ class CamerasTab(QWidget):
         outer.addWidget(scrollable(self._content_w))
 
     def load(self, cameras_cfg: dict):
-        # Remove old cards
         for card in self._cards.values():
             self._content_layout.removeWidget(card)
             card.deleteLater()
         self._cards.clear()
 
-        stretch_item = self._content_layout.itemAt(self._content_layout.count() - 1)
-
         for key, cfg in cameras_cfg.items():
             card = SingleCameraWidget(key, cfg)
             self._cards[key] = card
-            # Insert before the stretch
             self._content_layout.insertWidget(self._content_layout.count() - 1, card)
 
     def dump(self) -> dict:
@@ -576,8 +563,7 @@ class RecordingTab(QWidget):
         layout.setSpacing(16)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        # ---- Save path ----
-        path_box = QGroupBox("Save Location")
+        path_box    = QGroupBox("Save Location")
         path_layout = QHBoxLayout(path_box)
         self.save_dir = QLineEdit()
         self.save_dir.setPlaceholderText("./recordings")
@@ -588,7 +574,6 @@ class RecordingTab(QWidget):
         path_layout.addWidget(browse_btn)
         layout.addWidget(path_box)
 
-        # ---- Recording settings ----
         rec_box  = QGroupBox("Recording")
         rec_grid = QGridLayout(rec_box)
         rec_grid.setSpacing(10)
@@ -612,16 +597,14 @@ class RecordingTab(QWidget):
         self.split_size.setSpecialValueText("No splitting")
         self.split_size.setValue(0)
 
-        rec_grid.addWidget(make_label("Frame Rate"),    0, 0)
-        rec_grid.addWidget(self.fps,                    0, 1)
-        rec_grid.addWidget(make_label("JPEG Quality"),  0, 2)
-        rec_grid.addWidget(self.jpeg_quality,           0, 3)
-        rec_grid.addWidget(make_label("Split Size"),    1, 0)
-        rec_grid.addWidget(self.split_size,             1, 1)
-
+        rec_grid.addWidget(make_label("Frame Rate"),   0, 0)
+        rec_grid.addWidget(self.fps,                   0, 1)
+        rec_grid.addWidget(make_label("JPEG Quality"), 0, 2)
+        rec_grid.addWidget(self.jpeg_quality,          0, 3)
+        rec_grid.addWidget(make_label("Split Size"),   1, 0)
+        rec_grid.addWidget(self.split_size,            1, 1)
         layout.addWidget(rec_box)
 
-        # ---- ROI ----
         roi_box  = QGroupBox("Region of Interest (ROI)")
         roi_grid = QGridLayout(roi_box)
         roi_grid.setSpacing(10)
@@ -633,9 +616,8 @@ class RecordingTab(QWidget):
         self.roi_ox     = QSpinBox(); self.roi_ox.setRange(0, 8192);     self.roi_ox.setSuffix(" px")
         self.roi_oy     = QSpinBox(); self.roi_oy.setRange(0, 8192);     self.roi_oy.setSuffix(" px")
 
-        roi_note = QLabel("Offset is auto-centered when Width/Height are set. Override only if needed.")
+        roi_note = QLabel("Offset is auto-centered when Width/Height are set.")
         roi_note.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
-        roi_note.setWordWrap(True)
 
         roi_grid.addWidget(make_label("Width"),    0, 0)
         roi_grid.addWidget(self.roi_width,         0, 1)
@@ -646,10 +628,8 @@ class RecordingTab(QWidget):
         roi_grid.addWidget(make_label("Offset Y"), 1, 2)
         roi_grid.addWidget(self.roi_oy,            1, 3)
         roi_grid.addWidget(roi_note,               2, 0, 1, 4)
-
         layout.addWidget(roi_box)
 
-        # ---- Preview ----
         prev_box  = QGroupBox("Live Preview")
         prev_grid = QGridLayout(prev_box)
         prev_grid.setSpacing(10)
@@ -662,10 +642,9 @@ class RecordingTab(QWidget):
         self.preview_downsample.setSuffix("  (show every Nth frame)")
         self.preview_downsample.setValue(1)
 
-        prev_grid.addWidget(self.preview_enabled,                0, 0, 1, 2)
-        prev_grid.addWidget(make_label("Downsample Preview"),    1, 0)
-        prev_grid.addWidget(self.preview_downsample,             1, 1)
-
+        prev_grid.addWidget(self.preview_enabled,             0, 0, 1, 2)
+        prev_grid.addWidget(make_label("Downsample Preview"), 1, 0)
+        prev_grid.addWidget(self.preview_downsample,          1, 1)
         layout.addWidget(prev_box)
         layout.addStretch()
 
@@ -683,13 +662,11 @@ class RecordingTab(QWidget):
         self.jpeg_quality.setValue(rec.get("jpeg_quality", 90))
         split = rec.get("split_size_mb", None)
         self.split_size.setValue(split if split is not None else 0)
-
         roi = config.get("roi", {})
         self.roi_width.setValue(roi.get("width", 1020) or 0)
         self.roi_height.setValue(roi.get("height", 1020) or 0)
         self.roi_ox.setValue(roi.get("offset_x", 0))
         self.roi_oy.setValue(roi.get("offset_y", 0))
-
         prev = config.get("preview", {})
         self.preview_enabled.setChecked(prev.get("enabled", True))
         self.preview_downsample.setValue(prev.get("downsample", 1))
@@ -717,7 +694,7 @@ class RecordingTab(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Tab: Trigger & Metadata flags
+# Tab: Camera Trigger & Metadata flags
 # ---------------------------------------------------------------------------
 
 class TriggerTab(QWidget):
@@ -731,38 +708,35 @@ class TriggerTab(QWidget):
         layout.setSpacing(16)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        # ---- TTL Trigger ----
-        trig_box  = QGroupBox("Hardware TTL Trigger")
+        trig_box  = QGroupBox("Hardware TTL Trigger (Camera GPIO)")
         trig_grid = QGridLayout(trig_box)
         trig_grid.setSpacing(10)
         trig_grid.setColumnStretch(1, 1)
         trig_grid.setColumnStretch(3, 1)
 
-        self.trigger_enabled = QCheckBox("Enable hardware trigger")
-        self.trigger_line    = QComboBox()
+        self.trigger_enabled    = QCheckBox("Enable hardware trigger")
+        self.trigger_line       = QComboBox()
         self.trigger_line.addItems(["Line0", "Line1", "Line2", "Line3"])
         self.trigger_activation = QComboBox()
         self.trigger_activation.addItems(["RisingEdge", "FallingEdge", "AnyEdge", "LevelHigh", "LevelLow"])
-        self.trigger_selector = QComboBox()
+        self.trigger_selector   = QComboBox()
         self.trigger_selector.addItems(["AcquisitionStart", "FrameStart", "FrameBurstStart"])
-        self.trigger_timeout = QSpinBox()
+        self.trigger_timeout    = QSpinBox()
         self.trigger_timeout.setRange(100, 60_000)
         self.trigger_timeout.setSuffix(" ms")
         self.trigger_timeout.setValue(5000)
 
-        trig_grid.addWidget(self.trigger_enabled,               0, 0, 1, 4)
-        trig_grid.addWidget(make_label("GPIO Line"),            1, 0)
-        trig_grid.addWidget(self.trigger_line,                  1, 1)
-        trig_grid.addWidget(make_label("Activation"),           1, 2)
-        trig_grid.addWidget(self.trigger_activation,            1, 3)
-        trig_grid.addWidget(make_label("Trigger Selector"),     2, 0)
-        trig_grid.addWidget(self.trigger_selector,              2, 1)
-        trig_grid.addWidget(make_label("Timeout"),              2, 2)
-        trig_grid.addWidget(self.trigger_timeout,               2, 3)
-
+        trig_grid.addWidget(self.trigger_enabled,           0, 0, 1, 4)
+        trig_grid.addWidget(make_label("GPIO Line"),        1, 0)
+        trig_grid.addWidget(self.trigger_line,              1, 1)
+        trig_grid.addWidget(make_label("Activation"),       1, 2)
+        trig_grid.addWidget(self.trigger_activation,        1, 3)
+        trig_grid.addWidget(make_label("Trigger Selector"), 2, 0)
+        trig_grid.addWidget(self.trigger_selector,          2, 1)
+        trig_grid.addWidget(make_label("Timeout"),          2, 2)
+        trig_grid.addWidget(self.trigger_timeout,           2, 3)
         layout.addWidget(trig_box)
 
-        # ---- Metadata CSV flags ----
         meta_box  = QGroupBox("Per-frame Metadata CSV")
         meta_grid = QGridLayout(meta_box)
         meta_grid.setSpacing(8)
@@ -782,7 +756,6 @@ class TriggerTab(QWidget):
         meta_grid.addWidget(self.meta_timestamp,  1, 1)
         meta_grid.addWidget(self.meta_sestime,    2, 0)
         meta_grid.addWidget(self.meta_cputime,    2, 1)
-
         layout.addWidget(meta_box)
         layout.addStretch()
 
@@ -816,12 +789,202 @@ class TriggerTab(QWidget):
                 "timeout_ms": self.trigger_timeout.value(),
             },
             "metadata": {
-                "enabled":          self.meta_enabled.isChecked(),
-                "save_framecount":  self.meta_framecount.isChecked(),
-                "save_timestamp":   self.meta_timestamp.isChecked(),
-                "save_sestime":     self.meta_sestime.isChecked(),
-                "save_cputime":     self.meta_cputime.isChecked(),
+                "enabled":         self.meta_enabled.isChecked(),
+                "save_framecount": self.meta_framecount.isChecked(),
+                "save_timestamp":  self.meta_timestamp.isChecked(),
+                "save_sestime":    self.meta_sestime.isChecked(),
+                "save_cputime":    self.meta_cputime.isChecked(),
             },
+        }
+
+
+# ---------------------------------------------------------------------------
+# Tab: Morelia TTL  (NEW)
+# ---------------------------------------------------------------------------
+
+class MoreliaTTLTab(QWidget):
+    """
+    Configures the PC-side Morelia/Pinnacle TTL polling.
+    Writes to config['morelia_ttl'].
+
+    This is SEPARATE from the camera's hardware GPIO trigger (TriggerTab).
+    The Morelia device sends a TTL pulse; this script reads it via serial
+    using the binary GET TTL IN protocol (command 105 by default) and uses
+    it to start recording.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        content = QWidget()
+        layout  = QVBoxLayout(content)
+        layout.setSpacing(16)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # ---- Enable / disable ----
+        enable_box    = QGroupBox("Morelia TTL — PC-side Recording Trigger")
+        enable_layout = QVBoxLayout(enable_box)
+
+        self.enabled = QCheckBox(
+            "Enable Morelia TTL trigger  "
+            "(polls POD device; starts recording on pulse)"
+        )
+        self.enabled.setChecked(False)
+
+        note = QLabel(
+            "When enabled, the script polls the Morelia/Pinnacle POD device "
+            "over serial using the GET TTL IN binary protocol. On detection of "
+            "the configured edge, recording starts automatically.\n\n"
+            "Recording can also be started manually at any time by pressing R "
+            "in the preview window — both triggers are independent."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
+
+        enable_layout.addWidget(self.enabled)
+        enable_layout.addWidget(note)
+        layout.addWidget(enable_box)
+
+        # ---- Serial connection ----
+        serial_box  = QGroupBox("Serial Connection")
+        serial_grid = QGridLayout(serial_box)
+        serial_grid.setSpacing(10)
+        serial_grid.setColumnStretch(1, 1)
+        serial_grid.setColumnStretch(3, 1)
+
+        self.port = QLineEdit("COM3")
+        self.port.setPlaceholderText("e.g. COM3  or  /dev/ttyUSB0")
+
+        self.baud = QComboBox()
+        for b in [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]:
+            self.baud.addItem(str(b), b)
+        self.baud.setCurrentText("115200")
+
+        # Scan button — detects available serial ports
+        self.scan_btn = QPushButton("Scan ports")
+        self.scan_btn.setFixedWidth(100)
+        self.scan_btn.clicked.connect(self._scan_ports)
+
+        serial_grid.addWidget(make_label("Serial port"),  0, 0)
+        serial_grid.addWidget(self.port,                  0, 1)
+        serial_grid.addWidget(self.scan_btn,              0, 2)
+        serial_grid.addWidget(make_label("Baud rate"),    1, 0)
+        serial_grid.addWidget(self.baud,                  1, 1)
+
+        # Port list output
+        self._port_list_label = QLabel("")
+        self._port_list_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
+        serial_grid.addWidget(self._port_list_label, 2, 0, 1, 4)
+
+        layout.addWidget(serial_box)
+
+        # ---- TTL Signature ----
+        sig_box  = QGroupBox("TTL Signature (GET TTL IN — Command 105)")
+        sig_grid = QGridLayout(sig_box)
+        sig_grid.setSpacing(10)
+        sig_grid.setColumnStretch(1, 1)
+        sig_grid.setColumnStretch(3, 1)
+
+        self.command = QSpinBox()
+        self.command.setRange(0, 255)
+        self.command.setValue(105)
+        cmd_note = QLabel("105 = GET TTL IN  (default)")
+        cmd_note.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
+
+        self.pin = QSpinBox()
+        self.pin.setRange(0, 3)
+        self.pin.setValue(0)
+
+        self.polarity = QComboBox()
+        self.polarity.addItem("Rising edge  (High / 1)",  1)
+        self.polarity.addItem("Falling edge  (Low / 0)",  0)
+
+        self.poll_interval_ms = QSpinBox()
+        self.poll_interval_ms.setRange(1, 1000)
+        self.poll_interval_ms.setSuffix(" ms")
+        self.poll_interval_ms.setValue(10)
+        poll_note = QLabel("10 ms = 100 Hz polling rate")
+        poll_note.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
+
+        sig_grid.addWidget(make_label("Command number"), 0, 0)
+        sig_grid.addWidget(self.command,                 0, 1)
+        sig_grid.addWidget(cmd_note,                     0, 2, 1, 2)
+        sig_grid.addWidget(make_label("Pin  (0–3)"),     1, 0)
+        sig_grid.addWidget(self.pin,                     1, 1)
+        sig_grid.addWidget(make_label("Trigger on"),     1, 2)
+        sig_grid.addWidget(self.polarity,                1, 3)
+        sig_grid.addWidget(make_label("Poll interval"),  2, 0)
+        sig_grid.addWidget(self.poll_interval_ms,        2, 1)
+        sig_grid.addWidget(poll_note,                    2, 2, 1, 2)
+
+        layout.addWidget(sig_box)
+
+        # ---- Packet reference ----
+        ref_box    = QGroupBox("Binary Packet Reference")
+        ref_layout = QVBoxLayout(ref_box)
+        ref_text   = QLabel(
+            "Request  →  [Command U8] [Pin U8]          e.g. 0x69 0x00\n"
+            "Response ←  [Command U8] [State U8]        e.g. 0x69 0x01\n\n"
+            "State: 0 = Low (0 V)    1 = High (5 V)\n\n"
+            "Debounce (8480 only): configured on the device via SET TTL SETUP (Cmd 109).\n"
+            "The script reads the cleaned, post-debounce state."
+        )
+        ref_text.setStyleSheet(
+            f"font-family: 'Courier New', monospace; font-size: 11px; color: {TEXT_SEC};"
+        )
+        ref_text.setWordWrap(True)
+        ref_layout.addWidget(ref_text)
+        layout.addWidget(ref_box)
+
+        layout.addStretch()
+        outer.addWidget(scrollable(content))
+
+    # ---- Port scanner ----
+
+    def _scan_ports(self):
+        try:
+            import serial.tools.list_ports
+            ports = serial.tools.list_ports.comports()
+            if ports:
+                lines = [f"  {p.device}  —  {p.description}" for p in sorted(ports)]
+                self._port_list_label.setText("\n".join(lines))
+                # Auto-fill the first one if the field is still default
+                if self.port.text() in ("COM3", ""):
+                    self.port.setText(sorted(ports)[0].device)
+            else:
+                self._port_list_label.setText("  No serial ports detected.")
+        except ImportError:
+            self._port_list_label.setText("  pyserial not installed — pip install pyserial")
+
+    # ---- load / dump ----
+
+    def load(self, ttl_cfg: dict):
+        self.enabled.setChecked(ttl_cfg.get("enabled", False))
+        self.port.setText(ttl_cfg.get("port", "COM3"))
+        idx = self.baud.findText(str(ttl_cfg.get("baud", 115200)))
+        self.baud.setCurrentIndex(max(0, idx))
+        self.command.setValue(ttl_cfg.get("command", 105))
+        self.pin.setValue(ttl_cfg.get("pin", 0))
+
+        polarity_val = ttl_cfg.get("polarity", 1)
+        for i in range(self.polarity.count()):
+            if self.polarity.itemData(i) == polarity_val:
+                self.polarity.setCurrentIndex(i)
+                break
+
+        self.poll_interval_ms.setValue(ttl_cfg.get("poll_interval_ms", 10))
+
+    def dump(self) -> dict:
+        return {
+            "enabled":          self.enabled.isChecked(),
+            "port":             self.port.text().strip(),
+            "baud":             int(self.baud.currentText()),
+            "command":          self.command.value(),
+            "pin":              self.pin.value(),
+            "polarity":         self.polarity.currentData(),
+            "poll_interval_ms": self.poll_interval_ms.value(),
         }
 
 
@@ -833,7 +996,7 @@ class ConfigEditor(QMainWindow):
     def __init__(self, initial_path: str = None):
         super().__init__()
         self.setWindowTitle("Camera Acquisition — Config Editor")
-        self.resize(920, 740)
+        self.resize(960, 760)
         self.setStyleSheet(STYLESHEET)
 
         self._config_path: str | None = None
@@ -900,11 +1063,13 @@ class ConfigEditor(QMainWindow):
         self.cameras_tab   = CamerasTab()
         self.recording_tab = RecordingTab()
         self.trigger_tab   = TriggerTab()
+        self.morelia_tab   = MoreliaTTLTab()
 
         self.tabs.addTab(self.meta_tab,      "🧪  Experiment")
         self.tabs.addTab(self.cameras_tab,   "📷  Cameras")
         self.tabs.addTab(self.recording_tab, "🎬  Recording / ROI")
         self.tabs.addTab(self.trigger_tab,   "⚡  Trigger / CSV")
+        self.tabs.addTab(self.morelia_tab,   "🔌  Morelia TTL")
 
         main_layout.addWidget(self.tabs, 1)
 
@@ -918,7 +1083,6 @@ class ConfigEditor(QMainWindow):
     # ------------------------------------------------------------------
 
     def _try_auto_discover(self):
-        """Look for .yaml files in the current working directory."""
         yamls = sorted(glob.glob("*.yaml") + glob.glob("*.yml"))
         if len(yamls) == 1:
             self._load_file(yamls[0])
@@ -930,7 +1094,8 @@ class ConfigEditor(QMainWindow):
 
     def _browse_config(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Config File", os.getcwd(), "YAML Files (*.yaml *.yml);;All Files (*)"
+            self, "Open Config File", os.getcwd(),
+            "YAML Files (*.yaml *.yml);;All Files (*)"
         )
         if path:
             self._load_file(path)
@@ -949,30 +1114,30 @@ class ConfigEditor(QMainWindow):
         self._config_data = data
         self.file_picker.path_edit.setText(os.path.abspath(path))
 
-        # Populate tabs
         self.meta_tab.load(data.get("experiment_metadata", {}))
         self.cameras_tab.load(data.get("cameras", {}))
         self.recording_tab.load(data)
         self.trigger_tab.load(data)
+        self.morelia_tab.load(data.get("morelia_ttl", {}))
 
         self._dirty = False
         self._set_status(f"Loaded: {os.path.abspath(path)}", color=ACCENT2)
         self.setWindowTitle(f"Config Editor — {os.path.basename(path)}")
 
     def _collect(self) -> dict:
-        """Gather all tab values back into a config dict."""
-        rec_data = self.recording_tab.dump()
+        rec_data  = self.recording_tab.dump()
         trig_data = self.trigger_tab.dump()
 
-        merged = dict(self._config_data)  # preserve any unknown keys
-        merged["save_dir"]  = rec_data.pop("save_dir")
-        merged["cameras"]   = self.cameras_tab.dump()
-        merged["recording"] = rec_data["recording"]
-        merged["roi"]       = rec_data["roi"]
-        merged["preview"]   = rec_data["preview"]
-        merged["trigger"]   = trig_data["trigger"]
-        merged["metadata"]  = trig_data["metadata"]
+        merged = dict(self._config_data)
+        merged["save_dir"]            = rec_data.pop("save_dir")
+        merged["cameras"]             = self.cameras_tab.dump()
+        merged["recording"]           = rec_data["recording"]
+        merged["roi"]                 = rec_data["roi"]
+        merged["preview"]             = rec_data["preview"]
+        merged["trigger"]             = trig_data["trigger"]
+        merged["metadata"]            = trig_data["metadata"]
         merged["experiment_metadata"] = self.meta_tab.dump()
+        merged["morelia_ttl"]         = self.morelia_tab.dump()
         return merged
 
     def _save(self):
@@ -983,7 +1148,8 @@ class ConfigEditor(QMainWindow):
 
     def _save_as(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Config As", os.getcwd(), "YAML Files (*.yaml);;All Files (*)"
+            self, "Save Config As", os.getcwd(),
+            "YAML Files (*.yaml);;All Files (*)"
         )
         if path:
             if not path.endswith((".yaml", ".yml")):
@@ -1035,10 +1201,8 @@ class ConfigEditor(QMainWindow):
 
 def main():
     parser = argparse.ArgumentParser(description="Camera acquisition config GUI.")
-    parser.add_argument("-c", "--config", type=str, default=None,
-                        help="Path to a config YAML to open on startup.")
-    parser.add_argument("--dir", type=str, default=None,
-                        help="Working directory to search for YAML files.")
+    parser.add_argument("-c", "--config", type=str, default=None)
+    parser.add_argument("--dir", type=str, default=None)
     args = parser.parse_args()
 
     if args.dir:
@@ -1047,7 +1211,6 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    # Dark fusion palette as a fallback under the stylesheet
     palette = QPalette()
     palette.setColor(QPalette.Window,          QColor(DARK_BG))
     palette.setColor(QPalette.WindowText,      QColor(TEXT_PRI))
