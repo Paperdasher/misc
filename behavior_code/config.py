@@ -854,8 +854,8 @@ class MoreliaTTLTab(QWidget):
         serial_grid.setColumnStretch(1, 1)
         serial_grid.setColumnStretch(3, 1)
 
-        self.port = QLineEdit("COM3")
-        self.port.setPlaceholderText("e.g. COM3  or  /dev/ttyUSB0")
+        self.port = QLineEdit("COM1")
+        self.port.setPlaceholderText("e.g. COM1  or  /dev/ttyUSB0")
 
         self.baud = QComboBox()
         for b in [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]:
@@ -951,7 +951,7 @@ class MoreliaTTLTab(QWidget):
                 lines = [f"  {p.device}  —  {p.description}" for p in sorted(ports)]
                 self._port_list_label.setText("\n".join(lines))
                 # Auto-fill the first one if the field is still default
-                if self.port.text() in ("COM3", ""):
+                if self.port.text() in ("COM1", ""):
                     self.port.setText(sorted(ports)[0].device)
             else:
                 self._port_list_label.setText("  No serial ports detected.")
@@ -962,7 +962,7 @@ class MoreliaTTLTab(QWidget):
 
     def load(self, ttl_cfg: dict):
         self.enabled.setChecked(ttl_cfg.get("enabled", False))
-        self.port.setText(ttl_cfg.get("port", "COM3"))
+        self.port.setText(ttl_cfg.get("port", "COM1"))
         idx = self.baud.findText(str(ttl_cfg.get("baud", 115200)))
         self.baud.setCurrentIndex(max(0, idx))
         self.command.setValue(ttl_cfg.get("command", 105))

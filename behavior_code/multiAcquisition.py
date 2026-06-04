@@ -14,6 +14,13 @@ Recording triggers
     • Both triggers are independent; whichever fires first starts recording.
 
 Preview runs immediately on startup. Recording starts only on trigger.
+
+Required pip installs:
+- numpy
+- pyyaml
+- cv2
+- pyspin via spinnaker download
+- pyserial
 """
 
 import os
@@ -57,7 +64,7 @@ class TTLListener:
 
     def __init__(self, ttl_cfg: dict):
         self.enabled     = ttl_cfg.get("enabled", False)
-        self.port        = ttl_cfg.get("port",         "COM3")
+        self.port        = ttl_cfg.get("port",         "COM1")
         self.baud        = ttl_cfg.get("baud",         115200)
         self.cmd         = ttl_cfg.get("command",      105)
         self.pin         = ttl_cfg.get("pin",          0)
@@ -182,11 +189,13 @@ class CameraStreamer:
         self._capture_threads: list[threading.Thread] = []
         self._writer_threads:  list[threading.Thread] = []
 
+        # 90 out of 100 scale quality, no splitting video by data limit
         rec = config["recording"]
         self.fps           = rec["fps"]
         self.jpeg_quality  = rec.get("jpeg_quality", 90)
         self.split_size_mb = rec.get("split_size_mb", None)
 
+        # ROI of recording
         roi = config.get("roi", {})
         self.target_w = roi.get("width",    None)
         self.target_h = roi.get("height",   None)
@@ -203,11 +212,13 @@ class CameraStreamer:
 
         self.metadata_config = config.get("metadata", {})
 
+        # Create new directory for experiment named by yearMonthDay_HourMinuteSecond of the start time
         save_dir   = config["save_dir"]
         experiment = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.output_dir = os.path.join(save_dir, experiment)
         os.makedirs(self.output_dir, exist_ok=True)
 
+        # Save new config file in new directory
         with open(os.path.join(self.output_dir, "config.yaml"), "w") as f:
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
@@ -303,6 +314,7 @@ class CameraStreamer:
     # Metadata
     # ------------------------------------------------------------------
 
+    # Create CSV file for framecount, video timestamp, session elapsed time, cpu time at frame
     def _init_metadata(self, cam_name: str):
         if not self.metadata_config.get("enabled", False):
             return None, None
@@ -325,13 +337,14 @@ class CameraStreamer:
         print(f"{cam_name}: timestamps → {path}")
         return f, writer
 
+    # Append each component to CSV with 6 decimal place accuracy for time
     def _append_metadata(self, writer, framecount, timestamp, sestime, cputime):
         if writer is None:
             return
         cfg = self.metadata_config
         row = []
         if cfg.get("save_framecount", True): row.append(framecount)
-        if cfg.get("save_timestamp",  True): row.append(f"{timestamp:.9f}")
+        if cfg.get("save_timestamp",  True): row.append(f"{timestamp:.6f}")
         if cfg.get("save_sestime",    True): row.append(f"{sestime:.6f}")
         if cfg.get("save_cputime",    True): row.append(f"{cputime:.6f}")
         writer.writerow(row)
@@ -410,7 +423,7 @@ class CameraStreamer:
         return True
 
     # ------------------------------------------------------------------
-    # Spinnaker configuration (unchanged from original)
+    # Spinnaker configuration
     # ------------------------------------------------------------------
 
     def _configure_trigger(self, nodemap, cam_name: str) -> bool:
@@ -924,7 +937,7 @@ def run_setup_wizard(system: "PySpin.SystemPtr", output_path: str = "config.yaml
         # Morelia TTL — PC-side polling (separate from camera hardware trigger)
         "morelia_ttl": {
             "enabled":           False,
-            "port":              "COM3",
+            "port":              "COM1",
             "baud":              115200,
             "command":           105,
             "pin":               0,
