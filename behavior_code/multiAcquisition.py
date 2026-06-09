@@ -4,23 +4,38 @@ multiAcquisition.py — Multi-camera MJPEG/AVI acquisition
 Usage
 -----
     python multiAcquisition.py -c config.yaml
-    python multiAcquisition.py --setup          # interactive wizard
+    python multiAcquisition.py --setup
 
 Recording triggers
 ------------------
-    • Press  R  in any preview window to start recording manually.
-    • TTL pulse on the Morelia/Pinnacle POD device (polled via serial,
-      configured under  morelia_ttl  in config.yaml).
-    • Both triggers are independent; whichever fires first starts recording.
+    Each chamber has an independent TTL listener on its own serial port.
+    A TTL pulse starts recording for the camera mapped to that chamber.
+    Subsequent TTL pulses while recording is active are logged but do NOT
+    start a new recording.
 
-Preview runs immediately on startup. Recording starts only on trigger.
+    Manual trigger:  press R in any preview window (starts ALL cameras).
+    Auto-start mode: recording begins immediately when the script starts.
+    Preview always runs regardless of recording state.
+
+Config structure (config.yaml)
+-------------------------------
+    chambers:
+      chamber_A:
+        ttl:
+          port: COM3
+          baud: 115200
+          command: 105
+          pin: 0
+          polarity: 1          # 1=High/rising  0=Low/falling
+          poll_interval_ms: 10
+        camera: cam0           # key matching an entry under cameras:
+
+    acquisition:
+      auto_start: false        # true = start recording immediately on launch
 
 Required pip installs:
-- numpy
-- pyyaml
-- cv2
-- pyspin via spinnaker download
-- pyserial
+    numpy pyyaml opencv-python pyserial
+    PySpin via Spinnaker SDK
 """
 
 import os
@@ -32,6 +47,7 @@ import time
 import argparse
 import struct
 import csv
+from collections import deque
 from datetime import datetime
 
 import numpy as np
@@ -50,46 +66,57 @@ def load_config(path: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Morelia TTL Listener  (GET TTL IN — Command 105 or configured)
+# TTL event log entry
 # ---------------------------------------------------------------------------
 
-class TTLListener:
+class TTLEvent:
+    """One logged TTL pulse."""
+    def __init__(self, chamber: str, wall: float, sestime: float, label: str):
+        self.chamber = chamber
+        self.wall    = wall
+        self.sestime = sestime
+        self.label   = label
+
+
+# ---------------------------------------------------------------------------
+# Per-chamber TTL listener
+# ---------------------------------------------------------------------------
+
+class ChamberTTLListener:
     """
-    Polls a Morelia/Pinnacle POD device over serial using the binary
-    GET TTL IN packet (doc-1 methodology: [cmd U8][pin U8] → [cmd U8][state U8]).
-
-    Fires self._triggered once the configured polarity is detected.
-    Safe to construct even when ttl config is absent or disabled.
+    Polls a single serial port for one chamber's TTL signature.
+    Protocol: [cmd U8][pin U8] → [cmd U8][state U8]
+    Fires _triggered on the first matching pulse.
+    All subsequent matching pulses are pushed to event_queue for logging.
     """
 
-    def __init__(self, ttl_cfg: dict):
-        self.enabled     = ttl_cfg.get("enabled", False)
-        self.port        = ttl_cfg.get("port",         "COM1")
-        self.baud        = ttl_cfg.get("baud",         115200)
-        self.cmd         = ttl_cfg.get("command",      105)
-        self.pin         = ttl_cfg.get("pin",          0)
-        self.polarity    = ttl_cfg.get("polarity",     1)   # 1=High/rising 0=Low/falling
-        self.interval    = ttl_cfg.get("poll_interval_ms", 10) / 1000.0
+    def __init__(self, chamber_name: str, ttl_cfg: dict,
+                 event_queue: queue.Queue, session_start: float):
+        self.chamber      = chamber_name
+        self.port         = ttl_cfg.get("port",            "COM1")
+        self.baud         = ttl_cfg.get("baud",            115200)
+        self.cmd          = ttl_cfg.get("command",         105)
+        self.pin          = ttl_cfg.get("pin",             0)
+        self.polarity     = ttl_cfg.get("polarity",        1)
+        self.interval     = ttl_cfg.get("poll_interval_ms", 10) / 1000.0
+        self.label        = ttl_cfg.get("label",           chamber_name)
 
-        self._stop      = threading.Event()
-        self._triggered = threading.Event()
-        self._thread    = None
-
-    # ---- public -----------------------------------------------------------
+        self._event_queue  = event_queue
+        self._session_start = session_start
+        self._stop         = threading.Event()
+        self._triggered    = threading.Event()
+        self._thread       = None
+        # Debounce: ignore repeated High while pin stays High
+        self._last_state   = 0
 
     def start(self):
-        if not self.enabled:
-            return
         self._thread = threading.Thread(
-            target=self._poll_loop, daemon=True, name="ttl-listener"
+            target=self._poll_loop, daemon=True,
+            name=f"ttl-{self.chamber}"
         )
         self._thread.start()
-        edge = "RISING (High)" if self.polarity == 1 else "FALLING (Low)"
-        print(f"[TTL] Polling pin {self.pin} via cmd {self.cmd} "
-              f"on {self.port} @ {self.baud} baud — trigger on {edge}")
-
-    def wait_for_trigger(self, timeout=0) -> bool:
-        return self._triggered.wait(timeout=timeout)
+        edge = "RISING" if self.polarity == 1 else "FALLING"
+        print(f"[TTL:{self.chamber}] Polling {self.port} pin {self.pin} — {edge}")
 
     def triggered(self) -> bool:
         return self._triggered.is_set()
@@ -99,40 +126,198 @@ class TTLListener:
         if self._thread:
             self._thread.join(timeout=2.0)
 
-    # ---- internal ---------------------------------------------------------
-
     def _poll_loop(self):
         try:
             import serial
         except ImportError:
-            print("[TTL] pyserial not installed. pip install pyserial")
+            print(f"[TTL:{self.chamber}] pyserial not installed.")
             return
-
         try:
             ser = serial.Serial(port=self.port, baudrate=self.baud, timeout=0.1)
-        except serial.SerialException as e:
-            print(f"[TTL] Cannot open {self.port}: {e}")
+        except Exception as e:
+            print(f"[TTL:{self.chamber}] Cannot open {self.port}: {e}")
             return
 
-        print("[TTL] Serial open — waiting for pulse...")
+        print(f"[TTL:{self.chamber}] Serial open.")
         with ser:
             while not self._stop.is_set():
-                # Build [cmd U8][pin U8]
                 ser.reset_input_buffer()
                 ser.write(struct.pack("BB", self.cmd, self.pin))
                 resp = ser.read(2)
 
                 if len(resp) == 2:
                     cmd_echo, state = struct.unpack("BB", resp)
-                    if cmd_echo == self.cmd and state == self.polarity:
-                        ts = datetime.now().strftime("%H:%M:%S.%f")
-                        print(f"[TTL] Trigger detected (pin {self.pin}) at {ts}")
-                        self._triggered.set()
-                        break
+                    if cmd_echo == self.cmd:
+                        # Edge detection: only act on transition to polarity state
+                        if state == self.polarity and self._last_state != self.polarity:
+                            wall    = time.time()
+                            sestime = time.perf_counter() - self._session_start
+                            ts      = datetime.fromtimestamp(wall).strftime("%H:%M:%S.%f")
+                            print(f"[TTL:{self.chamber}] Pulse at {ts}  sestime={sestime:.3f}s")
+
+                            evt = TTLEvent(self.chamber, wall, sestime, self.label)
+                            self._event_queue.put(evt)
+
+                            if not self._triggered.is_set():
+                                self._triggered.set()   # first pulse fires recording
+
+                        self._last_state = state
 
                 time.sleep(self.interval)
 
-        print("[TTL] Poll loop exited.")
+        print(f"[TTL:{self.chamber}] Poll loop exited.")
+
+
+# ---------------------------------------------------------------------------
+# Per-camera writer
+# ---------------------------------------------------------------------------
+
+class CameraWriter:
+    """
+    Owns the ffmpeg subprocess and timestamp CSV for one camera.
+    Runs on its own thread, consuming from a queue.Queue.
+    TTL events are logged inline into the timestamp CSV.
+    """
+
+    def __init__(self, cam_name: str, cam_cfg: dict, output_dir: str,
+                 fps: float, jpeg_quality: int, metadata_cfg: dict,
+                 ttl_queue: queue.Queue):
+        self.cam_name      = cam_name
+        self.cam_cfg       = cam_cfg
+        self.output_dir    = output_dir
+        self.fps           = fps
+        self.jpeg_quality  = jpeg_quality
+        self.metadata_cfg  = metadata_cfg
+        self._ttl_queue    = ttl_queue  # TTLEvents destined for this camera
+
+        label           = cam_cfg.get("name", cam_name)
+        ts              = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.video_path = os.path.join(output_dir, f"{label}_{ts}.avi")
+        self.ts_path    = os.path.join(output_dir, f"{label}_timestamps.csv")
+
+        self._frame_queue  = queue.Queue()
+        self._stop         = threading.Event()
+        self._thread       = None
+        self.frame_count   = 0
+        self.start_wall    = None
+        self.end_wall      = None
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=f"writer-{self.cam_name}"
+        )
+        self._thread.start()
+
+    def push_frame(self, frame, framecount, timestamp, sestime, cputime):
+        self._frame_queue.put(("frame", frame, framecount, timestamp, sestime, cputime))
+
+    def stop(self):
+        self._frame_queue.put(("stop", None, None, None, None, None))
+        if self._thread:
+            self._thread.join(timeout=15.0)
+
+    def _run(self):
+        proc       = None
+        csv_file   = None
+        csv_writer = None
+        self.start_wall = time.time()
+
+        # Open timestamp CSV
+        if self.metadata_cfg.get("enabled", True):
+            csv_file   = open(self.ts_path, "w", newline="")
+            csv_writer = csv.writer(csv_file)
+            header = ["row_type"]
+            if self.metadata_cfg.get("save_framecount", True):  header.append("framecount")
+            if self.metadata_cfg.get("save_timestamp",  True):  header.append("camera_hw_timestamp_s")
+            if self.metadata_cfg.get("save_sestime",    True):  header.append("sestime_s")
+            if self.metadata_cfg.get("save_cputime",    True):  header.append("cpu_wall_clock_s")
+            header += ["ttl_chamber", "ttl_label"]
+            csv_writer.writerow(header)
+            csv_file.flush()
+            print(f"{self.cam_name}: timestamps → {self.ts_path}")
+
+        q_val = max(2, min(31, int(2 + (100 - self.jpeg_quality) * 29 / 100)))
+
+        while True:
+            # Drain any pending TTL events first (non-blocking)
+            while not self._ttl_queue.empty():
+                try:
+                    evt = self._ttl_queue.get_nowait()
+                    if csv_writer:
+                        row = ["ttl_event"]
+                        cfg = self.metadata_cfg
+                        if cfg.get("save_framecount", True): row.append("")
+                        if cfg.get("save_timestamp",  True): row.append(f"{evt.wall:.6f}")
+                        if cfg.get("save_sestime",    True): row.append(f"{evt.sestime:.6f}")
+                        if cfg.get("save_cputime",    True): row.append(f"{evt.wall:.6f}")
+                        row += [evt.chamber, evt.label]
+                        csv_writer.writerow(row)
+                        csv_file.flush()
+                except queue.Empty:
+                    break
+
+            # Get next frame item
+            try:
+                item = self._frame_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            kind = item[0]
+            if kind == "stop":
+                break
+
+            _, frame, framecount, timestamp, sestime, cputime = item
+
+            # Init ffmpeg on first frame
+            if proc is None:
+                h, w = frame.shape[:2]
+                if not shutil.which("ffmpeg"):
+                    print(f"{self.cam_name}: ffmpeg not found — cannot write video.")
+                    break
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-f",       "rawvideo",
+                    "-vcodec",  "rawvideo",
+                    "-pix_fmt", "gray",
+                    "-s",       f"{w}x{h}",
+                    "-r",       str(self.fps),
+                    "-i",       "pipe:0",
+                    "-vcodec",  "mjpeg",
+                    "-q:v",     str(q_val),
+                    "-pix_fmt", "yuvj420p",
+                    self.video_path,
+                ]
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL)
+                print(f"{self.cam_name}: writing → {self.video_path} ({w}×{h})")
+                time.sleep(0.05)
+
+            try:
+                proc.stdin.write(frame.tobytes())
+                self.frame_count += 1
+            except BrokenPipeError:
+                print(f"{self.cam_name}: ffmpeg pipe broken.")
+                break
+
+            # Log frame row
+            if csv_writer:
+                row = ["frame"]
+                cfg = self.metadata_cfg
+                if cfg.get("save_framecount", True): row.append(framecount)
+                if cfg.get("save_timestamp",  True): row.append(f"{timestamp:.6f}")
+                if cfg.get("save_sestime",    True): row.append(f"{sestime:.6f}")
+                if cfg.get("save_cputime",    True): row.append(f"{cputime:.6f}")
+                row += ["", ""]
+                csv_writer.writerow(row)
+
+        # Cleanup
+        self.end_wall = time.time()
+        if proc:
+            proc.stdin.close()
+            proc.wait()
+            print(f"{self.cam_name}: ffmpeg finished.")
+        if csv_file:
+            csv_file.close()
 
 
 # ---------------------------------------------------------------------------
@@ -140,69 +325,54 @@ class TTLListener:
 # ---------------------------------------------------------------------------
 
 class CameraStreamer:
+
     def __init__(self, config: dict, system: "PySpin.SystemPtr"):
         self.config      = config
         self.system      = system
         self._stop_event = threading.Event()
-        self.start_t     = time.perf_counter()
+        self.session_start = time.perf_counter()
 
-        # Only include enabled cameras
+        # Only enabled cameras
         self.cam_configs = {
             name: cfg
             for name, cfg in config["cameras"].items()
             if cfg.get("enabled", True)
         }
-
-        self.camera_count = len(self.cam_configs)
-        self.cam_names    = list(self.cam_configs.keys())
+        self.cam_names = list(self.cam_configs.keys())
         self.cameras: dict[str, PySpin.Camera] = {}
 
-        self.preview_frames = {name: None             for name in self.cam_names}
-        self.preview_locks  = {name: threading.Lock() for name in self.cam_names}
+        # Preview
+        self.preview_frames = {n: None             for n in self.cam_names}
+        self.preview_locks  = {n: threading.Lock() for n in self.cam_names}
 
-        # Per-camera writer queues — None means frame is dropped (not recording)
-        self.writer_queues: dict[str, queue.Queue | None] = {
-            name: None for name in self.cam_names
+        # Per-camera recording state
+        self._recording: dict[str, bool]            = {n: False for n in self.cam_names}
+        self._rec_lock  = threading.Lock()
+        self._writers:   dict[str, CameraWriter]    = {}
+
+        # TTL event queues: one per camera (writers drain these)
+        self._ttl_queues: dict[str, queue.Queue] = {
+            n: queue.Queue() for n in self.cam_names
         }
 
-        self._final_ttl_counts:   dict[str, int] = {}
-        self._final_frame_counts: dict[str, int] = {}
-
-        # ---- Recording state ----
-        # Shared event: set = recording active, clear = preview-only
-        self._recording = threading.Event()
-        self._rec_lock  = threading.Lock()
-
-        # Live stats
-        self._stats_locks = {name: threading.Lock() for name in self.cam_names}
-        self._stats: dict[str, dict] = {
-            name: {
-                "buffered_frames": 0,
-                "total_frames":    0,
-                "fps":             0.0,
-                "_ts_ring":        [],
-                "_ring_size":      30,
-            }
-            for name in self.cam_names
+        # Rolling FPS stats
+        self._stats_locks = {n: threading.Lock() for n in self.cam_names}
+        self._stats = {
+            n: {"total_frames": 0, "fps": 0.0,
+                "_ts_ring": deque(maxlen=30)}
+            for n in self.cam_names
         }
 
         self._capture_threads: list[threading.Thread] = []
-        self._writer_threads:  list[threading.Thread] = []
 
-        # 90 out of 100 scale quality, no splitting video by data limit
         rec = config["recording"]
-        self.fps           = rec["fps"]
-        self.jpeg_quality  = rec.get("jpeg_quality", 90)
-        self.split_size_mb = rec.get("split_size_mb", None)
+        self.fps          = rec["fps"]
+        self.jpeg_quality = rec.get("jpeg_quality", 90)
 
-        # ROI of recording
         roi = config.get("roi", {})
         self.target_w = roi.get("width",    None)
         self.target_h = roi.get("height",   None)
-        self.offset_x = roi.get("offset_x", 0)
-        self.offset_y = roi.get("offset_y", 0)
 
-        # Camera hardware trigger settings (separate from Morelia TTL)
         trig = config.get("trigger", {})
         self.trigger_enabled    = trig.get("enabled",    False)
         self.trigger_line       = trig.get("line",       "Line0")
@@ -210,250 +380,172 @@ class CameraStreamer:
         self.trigger_selector   = trig.get("selector",   "AcquisitionStart")
         self.trigger_timeout    = trig.get("timeout_ms", 5000)
 
-        self.metadata_config = config.get("metadata", {})
+        self.metadata_cfg = config.get("metadata", {})
 
-        # Create new directory for experiment named by yearMonthDay_HourMinuteSecond of the start time
         save_dir   = config["save_dir"]
         experiment = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.output_dir = os.path.join(save_dir, experiment)
         os.makedirs(self.output_dir, exist_ok=True)
 
-        # Save new config file in new directory
         with open(os.path.join(self.output_dir, "config.yaml"), "w") as f:
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
     # ------------------------------------------------------------------
-    # Recording control  (called from main thread or TTL listener)
+    # Recording control — per-camera
     # ------------------------------------------------------------------
 
-    def start_recording(self):
-        """
-        Activate recording for all cameras.
-        Creates writer queues and launches writer threads if not yet running.
-        Safe to call multiple times — only acts on first call.
-        """
+    def start_recording(self, cam_name: str):
+        """Start recording for one camera. No-op if already recording."""
         with self._rec_lock:
-            if self._recording.is_set():
-                return  # already recording
-
-            print("[Recorder] Starting recording...")
-
-            for name in self.cam_names:
-                # Create a fresh queue so the writer thread can consume frames
-                self.writer_queues[name] = queue.Queue()
-
-                wt = threading.Thread(
-                    target=self._write_frames,
-                    args=(name,),
-                    daemon=True,
-                    name=f"writer-{name}",
-                )
-                wt.start()
-                self._writer_threads.append(wt)
-
-            self._recording.set()
-            print("[Recorder] Recording active — press R to stop, or Ctrl+C.")
-
-    def stop_recording(self):
-        """Stop recording for all cameras (flush queues, close files)."""
-        with self._rec_lock:
-            if not self._recording.is_set():
+            if self._recording.get(cam_name):
                 return
+            print(f"[Recorder] Starting {cam_name}...")
+            writer = CameraWriter(
+                cam_name     = cam_name,
+                cam_cfg      = self.cam_configs[cam_name],
+                output_dir   = self.output_dir,
+                fps          = self.fps,
+                jpeg_quality = self.jpeg_quality,
+                metadata_cfg = self.metadata_cfg,
+                ttl_queue    = self._ttl_queues[cam_name],
+            )
+            writer.start()
+            self._writers[cam_name]   = writer
+            self._recording[cam_name] = True
 
-            print("[Recorder] Stopping recording...")
-            self._recording.clear()
+    def start_all_recording(self):
+        for name in self.cam_names:
+            self.start_recording(name)
 
-            # Signal each writer to finish by pushing sentinel None
-            for name in self.cam_names:
-                q = self.writer_queues[name]
-                if q is not None:
-                    q.put(None)
+    def stop_recording(self, cam_name: str):
+        with self._rec_lock:
+            if not self._recording.get(cam_name):
+                return
+            print(f"[Recorder] Stopping {cam_name}...")
+            self._recording[cam_name] = False
+            writer = self._writers.pop(cam_name, None)
+            if writer:
+                writer.stop()
+                self._write_session_summary(cam_name, writer)
 
-            for wt in self._writer_threads:
-                wt.join(timeout=10.0)
-            self._writer_threads.clear()
+    def stop_all_recording(self):
+        for name in list(self._writers.keys()):
+            self.stop_recording(name)
 
-            # Reset queues so a future start_recording() gets fresh ones
-            for name in self.cam_names:
-                self.writer_queues[name] = None
+    def is_recording(self, cam_name: str) -> bool:
+        return self._recording.get(cam_name, False)
 
-            print("[Recorder] Recording stopped.")
-
-    @property
-    def is_recording(self) -> bool:
-        return self._recording.is_set()
-
-    # ------------------------------------------------------------------
-    # Live stats
-    # ------------------------------------------------------------------
-
-    def get_stats(self, cam_name: str) -> dict:
-        with self._stats_locks[cam_name]:
-            s = self._stats[cam_name]
-            q = self.writer_queues.get(cam_name)
-            return {
-                "buffered_frames": q.qsize() if q is not None else 0,
-                "total_frames":    s["total_frames"],
-                "fps":             s["fps"],
-            }
-
-    def _update_stats(self, cam_name: str, total_frames: int):
-        now = time.perf_counter()
-        with self._stats_locks[cam_name]:
-            s    = self._stats[cam_name]
-            s["total_frames"] = total_frames
-            ring = s["_ts_ring"]
-            ring.append(now)
-            if len(ring) > s["_ring_size"]:
-                ring.pop(0)
-            if len(ring) >= 2:
-                elapsed = ring[-1] - ring[0]
-                s["fps"] = (len(ring) - 1) / elapsed if elapsed > 0 else 0.0
+    def any_recording(self) -> bool:
+        return any(self._recording.values())
 
     # ------------------------------------------------------------------
-    # Metadata
+    # TTL event routing
     # ------------------------------------------------------------------
 
-    # Create CSV file for framecount, video timestamp, session elapsed time, cpu time at frame
-    def _init_metadata(self, cam_name: str):
-        if not self.metadata_config.get("enabled", False):
-            return None, None
+    def route_ttl_event(self, evt: TTLEvent, cam_name: str):
+        """
+        Push a TTL event to the correct camera's writer queue.
+        If not yet recording, start recording first.
+        If already recording, event is logged only (no new recording).
+        """
+        already = self.is_recording(cam_name)
+        if not already:
+            self.start_recording(cam_name)
 
-        cfg   = self.metadata_config
-        label = self.cam_configs[cam_name].get("name", cam_name)
-        path  = os.path.join(self.output_dir, f"{label}_timestamps.csv")
+        # Always log the event — queue is drained by writer
+        self._ttl_queues[cam_name].put(evt)
 
-        f      = open(path, "w", newline="")
-        writer = csv.writer(f)
+        if already:
+            print(f"[TTL] {evt.chamber} pulse logged to {cam_name} "
+                  f"(already recording — no new file)")
 
-        header = []
-        if cfg.get("save_framecount", True): header.append("framecount")
-        if cfg.get("save_timestamp",  True): header.append("camera_hardware_timestamp_s")
-        if cfg.get("save_sestime",    True): header.append("sestime_s")
-        if cfg.get("save_cputime",    True): header.append("cpu_wall_clock_s")
+    # ------------------------------------------------------------------
+    # Session summary CSV
+    # ------------------------------------------------------------------
 
-        writer.writerow(header)
-        f.flush()
-        print(f"{cam_name}: timestamps → {path}")
-        return f, writer
-
-    # Append each component to CSV with 6 decimal place accuracy for time
-    def _append_metadata(self, writer, framecount, timestamp, sestime, cputime):
-        if writer is None:
-            return
-        cfg = self.metadata_config
-        row = []
-        if cfg.get("save_framecount", True): row.append(framecount)
-        if cfg.get("save_timestamp",  True): row.append(f"{timestamp:.6f}")
-        if cfg.get("save_sestime",    True): row.append(f"{sestime:.6f}")
-        if cfg.get("save_cputime",    True): row.append(f"{cputime:.6f}")
-        writer.writerow(row)
-
-    def _write_session_summary(
-        self, cam_name, video_path, timestamp_path,
-        start_wall, end_wall, total_frames, ttl_count,
-    ):
-        if not self.metadata_config.get("enabled", False):
+    def _write_session_summary(self, cam_name: str, writer: CameraWriter):
+        if not self.metadata_cfg.get("enabled", True):
             return
 
         label    = self.cam_configs[cam_name].get("name", cam_name)
         path     = os.path.join(self.output_dir, f"{label}_session.csv")
-        duration = end_wall - start_wall
-        avg_fps  = total_frames / duration if duration > 0 else 0.0
-        start_dt = datetime.fromtimestamp(start_wall)
-        end_dt   = datetime.fromtimestamp(end_wall)
+        duration = (writer.end_wall - writer.start_wall) if writer.end_wall else 0
+        avg_fps  = writer.frame_count / duration if duration > 0 else 0
+        start_dt = datetime.fromtimestamp(writer.start_wall)
+        end_dt   = datetime.fromtimestamp(writer.end_wall or writer.start_wall)
         exp_meta = self.config.get("experiment_metadata", {})
         cam_cfg  = self.cam_configs[cam_name]
         expected = int(round(self.fps * duration))
 
         fields = {
-            "experimenter_name":       exp_meta.get("experimenter_name", ""),
-            "experiment_name":         exp_meta.get("experiment_name", ""),
-            "camera_name":             label,
-            "chamber":                 cam_cfg.get("chamber", exp_meta.get("chamber", "")),
-            "animal_id":               exp_meta.get("animal_id", ""),
-            "genotype":                exp_meta.get("genotype", ""),
-            "group":                   exp_meta.get("group", ""),
-            "schedule_name":           exp_meta.get("schedule_name", ""),
-            "date":                    start_dt.strftime("%Y-%m-%d"),
-            "acquisition_start":       start_dt.strftime("%H:%M:%S.%f"),
-            "acquisition_end":         end_dt.strftime("%H:%M:%S.%f"),
-            "duration_s":              f"{duration:.3f}",
-            "total_frames":            total_frames,
-            "frames_dropped":          max(0, expected - total_frames),
-            "ttl_pulses_received":     ttl_count,
-            "avg_sampling_rate_hz":    f"{avg_fps:.4f}",
-            "video_path":              os.path.abspath(video_path),
-            "timestamp_file_path":     os.path.abspath(timestamp_path) if timestamp_path else "",
-            "computer_timestamps_from":"time.time() — Unix epoch seconds (UTC)",
+            "experimenter_name":         exp_meta.get("experimenter_name", ""),
+            "experiment_name":           exp_meta.get("experiment_name", ""),
+            "camera_name":               label,
+            "chamber":                   cam_cfg.get("chamber", ""),
+            "animal_id":                 exp_meta.get("animal_id", ""),
+            "genotype":                  exp_meta.get("genotype", ""),
+            "group":                     exp_meta.get("group", ""),
+            "schedule_name":             exp_meta.get("schedule_name", ""),
+            "date":                      start_dt.strftime("%Y-%m-%d"),
+            "acquisition_start":         start_dt.strftime("%H:%M:%S.%f"),
+            "acquisition_end":           end_dt.strftime("%H:%M:%S.%f"),
+            "duration_s":                f"{duration:.3f}",
+            "total_frames":              writer.frame_count,
+            "frames_dropped":            max(0, expected - writer.frame_count),
+            "avg_sampling_rate_hz":      f"{avg_fps:.4f}",
+            "video_path":                os.path.abspath(writer.video_path),
+            "timestamp_file_path":       os.path.abspath(writer.ts_path),
             "eeg_fiber_photometry_path": exp_meta.get("eeg_fiber_photometry_path", ""),
-            "notes":                   exp_meta.get("notes", ""),
+            "notes":                     exp_meta.get("notes", ""),
         }
 
         with open(path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(fields.keys()))
-            writer.writeheader()
-            writer.writerow(fields)
+            w = csv.DictWriter(f, fieldnames=list(fields.keys()))
+            w.writeheader()
+            w.writerow(fields)
         print(f"{cam_name}: session summary → {path}")
 
     # ------------------------------------------------------------------
-    # Camera lookup
+    # Stats
     # ------------------------------------------------------------------
 
-    def _find_cameras(self) -> bool:
-        cam_list = self.system.GetCameras()
-        serials_wanted = {
-            cfg["serial"]: name
-            for name, cfg in self.cam_configs.items()
-        }
-        for cam in cam_list:
-            node = PySpin.CStringPtr(
-                cam.GetTLDeviceNodeMap().GetNode("DeviceSerialNumber")
-            )
-            if PySpin.IsAvailable(node) and PySpin.IsReadable(node):
-                serial = node.GetValue()
-                if serial in serials_wanted:
-                    self.cameras[serials_wanted[serial]] = cam
-        cam_list.Clear()
+    def get_stats(self, cam_name: str) -> dict:
+        with self._stats_locks[cam_name]:
+            s = self._stats[cam_name]
+            return {"fps": s["fps"], "total_frames": s["total_frames"]}
 
-        missing = [n for n in self.cam_names if n not in self.cameras]
-        if missing:
-            print(f"Could not find cameras: {missing}")
-            return False
-        return True
+    def _update_stats(self, cam_name: str, total: int):
+        now = time.perf_counter()
+        with self._stats_locks[cam_name]:
+            s    = self._stats[cam_name]
+            s["total_frames"] = total
+            ring = s["_ts_ring"]
+            ring.append(now)
+            if len(ring) >= 2:
+                elapsed = ring[-1] - ring[0]
+                s["fps"] = (len(ring) - 1) / elapsed if elapsed > 0 else 0.0
 
     # ------------------------------------------------------------------
-    # Spinnaker configuration
+    # Spinnaker config
     # ------------------------------------------------------------------
 
     def _configure_trigger(self, nodemap, cam_name: str) -> bool:
         try:
-            node_trigger_mode = PySpin.CEnumerationPtr(nodemap.GetNode("TriggerMode"))
-            if PySpin.IsAvailable(node_trigger_mode) and PySpin.IsWritable(node_trigger_mode):
-                node_trigger_mode.SetIntValue(
-                    node_trigger_mode.GetEntryByName("Off").GetValue()
-                )
-            node_trigger_selector = PySpin.CEnumerationPtr(nodemap.GetNode("TriggerSelector"))
-            if PySpin.IsAvailable(node_trigger_selector) and PySpin.IsWritable(node_trigger_selector):
-                node_trigger_selector.SetIntValue(
-                    node_trigger_selector.GetEntryByName(self.trigger_selector).GetValue()
-                )
-            node_trigger_source = PySpin.CEnumerationPtr(nodemap.GetNode("TriggerSource"))
-            if PySpin.IsAvailable(node_trigger_source) and PySpin.IsWritable(node_trigger_source):
-                node_trigger_source.SetIntValue(
-                    node_trigger_source.GetEntryByName(self.trigger_line).GetValue()
-                )
-            node_trigger_activation = PySpin.CEnumerationPtr(nodemap.GetNode("TriggerActivation"))
-            if PySpin.IsAvailable(node_trigger_activation) and PySpin.IsWritable(node_trigger_activation):
-                node_trigger_activation.SetIntValue(
-                    node_trigger_activation.GetEntryByName(self.trigger_activation).GetValue()
-                )
-            if PySpin.IsAvailable(node_trigger_mode) and PySpin.IsWritable(node_trigger_mode):
-                node_trigger_mode.SetIntValue(
-                    node_trigger_mode.GetEntryByName("On").GetValue()
-                )
-            print(f"  {cam_name}: trigger ON — {self.trigger_line} "
-                  f"{self.trigger_activation} {self.trigger_selector}")
+            tm = PySpin.CEnumerationPtr(nodemap.GetNode("TriggerMode"))
+            if PySpin.IsAvailable(tm) and PySpin.IsWritable(tm):
+                tm.SetIntValue(tm.GetEntryByName("Off").GetValue())
+            ts = PySpin.CEnumerationPtr(nodemap.GetNode("TriggerSelector"))
+            if PySpin.IsAvailable(ts) and PySpin.IsWritable(ts):
+                ts.SetIntValue(ts.GetEntryByName(self.trigger_selector).GetValue())
+            tsrc = PySpin.CEnumerationPtr(nodemap.GetNode("TriggerSource"))
+            if PySpin.IsAvailable(tsrc) and PySpin.IsWritable(tsrc):
+                tsrc.SetIntValue(tsrc.GetEntryByName(self.trigger_line).GetValue())
+            ta = PySpin.CEnumerationPtr(nodemap.GetNode("TriggerActivation"))
+            if PySpin.IsAvailable(ta) and PySpin.IsWritable(ta):
+                ta.SetIntValue(ta.GetEntryByName(self.trigger_activation).GetValue())
+            if PySpin.IsAvailable(tm) and PySpin.IsWritable(tm):
+                tm.SetIntValue(tm.GetEntryByName("On").GetValue())
+            print(f"  {cam_name}: HW trigger ON — {self.trigger_line} {self.trigger_activation}")
             return True
         except PySpin.SpinnakerException as ex:
             print(f"  {cam_name} trigger config error: {ex}")
@@ -463,79 +555,52 @@ class CameraStreamer:
         nodemap = cam.GetNodeMap()
         print(f"\n{cam_name}: configuring...")
         try:
-            node_pixel_format = PySpin.CEnumerationPtr(nodemap.GetNode("PixelFormat"))
-            if PySpin.IsAvailable(node_pixel_format) and PySpin.IsWritable(node_pixel_format):
-                for fmt_name in ["Mono8", "Mono16", "BayerRG8", "BGR8"]:
-                    node_entry = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName(fmt_name))
-                    if PySpin.IsAvailable(node_entry) and PySpin.IsReadable(node_entry):
-                        node_pixel_format.SetIntValue(node_entry.GetValue())
-                        print(f"  Pixel format: {fmt_name}")
+            pf = PySpin.CEnumerationPtr(nodemap.GetNode("PixelFormat"))
+            if PySpin.IsAvailable(pf) and PySpin.IsWritable(pf):
+                for fmt in ["Mono8", "Mono16", "BayerRG8", "BGR8"]:
+                    e = PySpin.CEnumEntryPtr(pf.GetEntryByName(fmt))
+                    if PySpin.IsAvailable(e) and PySpin.IsReadable(e):
+                        pf.SetIntValue(e.GetValue())
+                        print(f"  Pixel format: {fmt}")
                         break
 
-            if self.target_w is not None and self.target_h is not None:
-                node_offset_x = PySpin.CIntegerPtr(nodemap.GetNode("OffsetX"))
-                node_offset_y = PySpin.CIntegerPtr(nodemap.GetNode("OffsetY"))
-                node_width    = PySpin.CIntegerPtr(nodemap.GetNode("Width"))
-                node_height   = PySpin.CIntegerPtr(nodemap.GetNode("Height"))
-
-                if PySpin.IsAvailable(node_offset_x) and PySpin.IsWritable(node_offset_x):
-                    node_offset_x.SetValue(node_offset_x.GetMin())
-                if PySpin.IsAvailable(node_offset_y) and PySpin.IsWritable(node_offset_y):
-                    node_offset_y.SetValue(node_offset_y.GetMin())
-
-                actual_w = node_width.GetMax()
-                if PySpin.IsAvailable(node_width) and PySpin.IsWritable(node_width):
-                    w_min = node_width.GetMin()
-                    w_inc = node_width.GetInc()
-                    w_set = w_min + ((min(self.target_w, node_width.GetMax()) - w_min) // w_inc) * w_inc
-                    node_width.SetValue(w_set)
-                    actual_w = node_width.GetValue()
-                    print(f"  Width: {actual_w}")
-
-                actual_h = node_height.GetMax()
-                if PySpin.IsAvailable(node_height) and PySpin.IsWritable(node_height):
-                    h_min = node_height.GetMin()
-                    h_inc = node_height.GetInc()
-                    h_set = h_min + ((min(self.target_h, node_height.GetMax()) - h_min) // h_inc) * h_inc
-                    node_height.SetValue(h_set)
-                    actual_h = node_height.GetValue()
-                    print(f"  Height: {actual_h}")
-
-                sensor_w = node_offset_x.GetMax() + actual_w
-                sensor_h = node_offset_y.GetMax() + actual_h
-
-                if PySpin.IsAvailable(node_offset_x) and PySpin.IsWritable(node_offset_x):
-                    x_inc = node_offset_x.GetInc()
-                    x_set = ((((sensor_w - actual_w) // 2)) // x_inc) * x_inc
-                    x_set = max(node_offset_x.GetMin(), min(node_offset_x.GetMax(), x_set))
-                    node_offset_x.SetValue(x_set)
-                    print(f"  OffsetX: {x_set}")
-
-                if PySpin.IsAvailable(node_offset_y) and PySpin.IsWritable(node_offset_y):
-                    y_inc = node_offset_y.GetInc()
-                    y_set = ((((sensor_h - actual_h) // 2)) // y_inc) * y_inc
-                    y_set = max(node_offset_y.GetMin(), min(node_offset_y.GetMax(), y_set))
-                    node_offset_y.SetValue(y_set)
-                    print(f"  OffsetY: {y_set}")
+            if self.target_w and self.target_h:
+                ox = PySpin.CIntegerPtr(nodemap.GetNode("OffsetX"))
+                oy = PySpin.CIntegerPtr(nodemap.GetNode("OffsetY"))
+                nw = PySpin.CIntegerPtr(nodemap.GetNode("Width"))
+                nh = PySpin.CIntegerPtr(nodemap.GetNode("Height"))
+                for n in [ox, oy]:
+                    if PySpin.IsAvailable(n) and PySpin.IsWritable(n):
+                        n.SetValue(n.GetMin())
+                for node, target, label in [(nw, self.target_w, "Width"),
+                                             (nh, self.target_h, "Height")]:
+                    if PySpin.IsAvailable(node) and PySpin.IsWritable(node):
+                        mn, inc = node.GetMin(), node.GetInc()
+                        v = mn + ((min(target, node.GetMax()) - mn) // inc) * inc
+                        node.SetValue(v)
+                        print(f"  {label}: {node.GetValue()}")
+                # Center offsets
+                sensor_w = ox.GetMax() + nw.GetValue()
+                sensor_h = oy.GetMax() + nh.GetValue()
+                for node, sensor, actual in [(ox, sensor_w, nw.GetValue()),
+                                              (oy, sensor_h, nh.GetValue())]:
+                    if PySpin.IsAvailable(node) and PySpin.IsWritable(node):
+                        inc = node.GetInc()
+                        v   = (((sensor - actual) // 2) // inc) * inc
+                        v   = max(node.GetMin(), min(node.GetMax(), v))
+                        node.SetValue(v)
 
             if self.trigger_enabled:
                 self._configure_trigger(nodemap, cam_name)
 
-            node_acq_mode = PySpin.CEnumerationPtr(nodemap.GetNode("AcquisitionMode"))
-            if PySpin.IsAvailable(node_acq_mode) and PySpin.IsWritable(node_acq_mode):
-                node_continuous = node_acq_mode.GetEntryByName("Continuous")
-                if PySpin.IsAvailable(node_continuous) and PySpin.IsReadable(node_continuous):
-                    node_acq_mode.SetIntValue(node_continuous.GetValue())
+            acq = PySpin.CEnumerationPtr(nodemap.GetNode("AcquisitionMode"))
+            if PySpin.IsAvailable(acq) and PySpin.IsWritable(acq):
+                cont = acq.GetEntryByName("Continuous")
+                if PySpin.IsAvailable(cont) and PySpin.IsReadable(cont):
+                    acq.SetIntValue(cont.GetValue())
                     print("  AcquisitionMode: Continuous")
-                else:
-                    print(f"  {cam_name}: Continuous mode not available.")
-                    return False
 
-            if cam.ExposureAuto.GetAccessMode() != PySpin.RW:
-                print("Unable to disable automatic exposure.")
-                return False
             cam.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
-
             cam_cfg = self.cam_configs[cam_name]
             cam.ExposureTime.SetValue(min(15000, cam_cfg.get("exposure_us", 14000)))
             print(f"  Exposure: {cam.ExposureTime.GetValue()} µs")
@@ -544,33 +609,43 @@ class CameraStreamer:
             cam.Gain.SetValue(min(cam.Gain.GetMax(), cam_cfg.get("gain_db", 10)))
             print(f"  Gain: {cam.Gain.GetValue():.1f} dB")
 
-            for node_name, val, label in [
-                ("IspEnable",    False, "ISP disabled"),
-                ("GammaEnable",  False, "Gamma disabled"),
-            ]:
+            for node_name, val, lbl in [("IspEnable", False, "ISP disabled"),
+                                         ("GammaEnable", False, "Gamma disabled")]:
                 n = PySpin.CBooleanPtr(nodemap.GetNode(node_name))
                 if PySpin.IsAvailable(n) and PySpin.IsWritable(n):
-                    n.SetValue(val); print(f"  {label}")
-
-            n = PySpin.CFloatPtr(nodemap.GetNode("Gamma"))
-            if PySpin.IsAvailable(n) and PySpin.IsWritable(n):
-                n.SetValue(1.0); print("  Gamma: 1.0")
+                    n.SetValue(val); print(f"  {lbl}")
 
             n = PySpin.CFloatPtr(nodemap.GetNode("BlackLevel"))
             if PySpin.IsAvailable(n) and PySpin.IsWritable(n):
-                bl = cam_cfg.get("black_level", 2.0)
-                n.SetValue(bl); print(f"  BlackLevel: {bl}")
+                n.SetValue(cam_cfg.get("black_level", 2.0))
 
             n = PySpin.CIntegerPtr(nodemap.GetNode("DeviceLinkThroughputLimit"))
             if PySpin.IsAvailable(n) and PySpin.IsWritable(n):
                 tl = max(n.GetMin(), min(n.GetMax(), cam_cfg.get("throughput_limit", 90_000_000)))
-                n.SetValue(tl); print(f"  ThroughputLimit: {tl}")
+                n.SetValue(tl)
 
             return True
-
         except PySpin.SpinnakerException as ex:
             print(f"  {cam_name} configure error: {ex}")
             return False
+
+    def _find_cameras(self) -> bool:
+        cam_list       = self.system.GetCameras()
+        serials_wanted = {cfg["serial"]: name
+                          for name, cfg in self.cam_configs.items()}
+        for cam in cam_list:
+            node = PySpin.CStringPtr(
+                cam.GetTLDeviceNodeMap().GetNode("DeviceSerialNumber"))
+            if PySpin.IsAvailable(node) and PySpin.IsReadable(node):
+                s = node.GetValue()
+                if s in serials_wanted:
+                    self.cameras[serials_wanted[s]] = cam
+        cam_list.Clear()
+        missing = [n for n in self.cam_names if n not in self.cameras]
+        if missing:
+            print(f"Could not find cameras: {missing}")
+            return False
+        return True
 
     def _init_cameras(self):
         if not self._find_cameras():
@@ -579,156 +654,58 @@ class CameraStreamer:
             cam.Init()
             self._configure_camera(cam, name)
             cam.BeginAcquisition()
-            print(f"{name}: streaming (preview only — not recording yet)")
+            print(f"{name}: streaming (preview only)")
 
     # ------------------------------------------------------------------
-    # Capture thread — always runs; frames only queued when recording
+    # Capture thread — always running; routes to writer only if recording
     # ------------------------------------------------------------------
 
     def _capture_frame(self, cam_name: str, cam):
-        preview_cfg = self.config.get("preview", {})
-        downsample  = preview_cfg.get("downsample", 1)
-        frame_idx   = 0
+        downsample = self.config.get("preview", {}).get("downsample", 1)
+        frame_idx  = 0
 
         while not self._stop_event.is_set():
             try:
-                image_result = cam.GetNextImage(self.trigger_timeout)
-
-                if image_result.IsIncomplete():
-                    image_result.Release()
+                image = cam.GetNextImage(self.trigger_timeout)
+                if image.IsIncomplete():
+                    image.Release()
                     continue
 
-                framecount = image_result.GetFrameID()
-                timestamp  = image_result.GetTimeStamp() * 1e-9
-                sestime    = time.perf_counter() - self.start_t
+                framecount = image.GetFrameID()
+                timestamp  = image.GetTimeStamp() * 1e-9
+                sestime    = time.perf_counter() - self.session_start
                 cputime    = time.time()
-
-                frame = np.array(image_result.GetNDArray(), copy=True)
-                image_result.Release()
+                frame      = np.array(image.GetNDArray(), copy=True)
+                image.Release()
 
                 frame_idx += 1
                 self._update_stats(cam_name, frame_idx)
 
-                # Always update preview
                 if (frame_idx - 1) % downsample == 0:
                     with self.preview_locks[cam_name]:
                         self.preview_frames[cam_name] = frame
 
-                # Only push to writer queue when actively recording
-                if self._recording.is_set():
-                    q = self.writer_queues.get(cam_name)
-                    if q is not None:
-                        q.put((frame, framecount, timestamp, sestime, cputime))
+                # Only push to writer when this camera is recording
+                if self._recording.get(cam_name):
+                    writer = self._writers.get(cam_name)
+                    if writer:
+                        writer.push_frame(frame, framecount, timestamp,
+                                          sestime, cputime)
 
             except PySpin.SpinnakerException as ex:
                 if not self._stop_event.is_set():
                     print(f"{cam_name} capture error: {ex}")
 
-        self._final_frame_counts[cam_name] = frame_idx
-
-    # ------------------------------------------------------------------
-    # Writer thread — MJPEG → AVI
-    # ------------------------------------------------------------------
-
-    def _make_ffmpeg_writer(self, output_path, width, height):
-        if not shutil.which("ffmpeg"):
-            raise RuntimeError("ffmpeg not found on PATH")
-        q_val = max(2, min(31, int(2 + (100 - self.jpeg_quality) * 29 / 100)))
-        cmd = [
-            "ffmpeg", "-y",
-            "-f",       "rawvideo",
-            "-vcodec",  "rawvideo",
-            "-pix_fmt", "gray",
-            "-s",       f"{width}x{height}",
-            "-r",       str(self.fps),
-            "-i",       "pipe:0",
-            "-vcodec",  "mjpeg",
-            "-q:v",     str(q_val),
-            "-pix_fmt", "yuvj420p",
-            output_path,
-        ]
-        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-
-    def _write_frames(self, cam_name: str):
-        cam_cfg     = self.cam_configs[cam_name]
-        label       = cam_cfg.get("name", cam_name)
-        ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(self.output_dir, f"{label}_{ts}.avi")
-
-        proc                      = None
-        metadata_file, csv_writer = self._init_metadata(cam_name)
-        timestamp_path            = (
-            os.path.join(self.output_dir, f"{label}_timestamps.csv")
-            if metadata_file is not None else None
-        )
-        start_wall  = time.time()
-        frame_count = 0
-
-        q = self.writer_queues[cam_name]
-
-        while True:
-            try:
-                item = q.get(timeout=1.0)
-            except queue.Empty:
-                # If recording was stopped via sentinel, queue will have None;
-                # if not, keep draining
-                if not self._recording.is_set():
-                    break
-                continue
-
-            if item is None:
-                break   # sentinel pushed by stop_recording()
-
-            frame, framecount, timestamp, sestime, cputime = item
-
-            if proc is None:
-                h, w = frame.shape[:2]
-                proc = self._make_ffmpeg_writer(output_path, w, h)
-                print(f"{cam_name}: writing → {output_path}  ({w}×{h}  q={self.jpeg_quality})")
-                time.sleep(0.1)
-
-            try:
-                proc.stdin.write(frame.tobytes())
-                frame_count += 1
-            except BrokenPipeError:
-                print(f"{cam_name}: ffmpeg pipe broken.")
-                break
-
-            self._append_metadata(csv_writer, framecount, timestamp, sestime, cputime)
-
-        end_wall = time.time()
-
-        if proc:
-            proc.stdin.close()
-            proc.wait()
-            print(f"{cam_name}: ffmpeg writer finished.")
-
-        if metadata_file is not None:
-            metadata_file.close()
-
-        ttl_count = self._final_ttl_counts.get(cam_name, frame_count)
-        self._write_session_summary(
-            cam_name, output_path, timestamp_path,
-            start_wall, end_wall, frame_count, ttl_count,
-        )
-
-    # ------------------------------------------------------------------
-    # Thread startup
-    # ------------------------------------------------------------------
-
     def _start_threads(self):
         for name, cam in self.cameras.items():
-            ct = threading.Thread(
-                target=self._capture_frame,
-                args=(name, cam),
-                daemon=True,
-                name=f"capture-{name}",
-            )
+            ct = threading.Thread(target=self._capture_frame,
+                                  args=(name, cam), daemon=True,
+                                  name=f"capture-{name}")
             ct.start()
             self._capture_threads.append(ct)
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public
     # ------------------------------------------------------------------
 
     def get_preview(self, cam_name: str):
@@ -736,14 +713,15 @@ class CameraStreamer:
             return self.preview_frames[cam_name]
 
     def stop(self):
-        print("\nStopping acquisition...")
-        if self.is_recording:
-            self.stop_recording()
+        print("\nStopping...")
+        self.stop_all_recording()
         self._stop_event.set()
-
         for cam in self.cameras.values():
-            cam.EndAcquisition()
-            cam.DeInit()
+            try:
+                cam.EndAcquisition()
+                cam.DeInit()
+            except Exception:
+                pass
         self.cameras.clear()
 
 
@@ -751,64 +729,52 @@ class CameraStreamer:
 # Preview overlay
 # ---------------------------------------------------------------------------
 
-def draw_stats_overlay(
-    frame: np.ndarray,
-    stats: dict,
-    cam_label: str,
-    recording: bool,
-    ttl_enabled: bool,
-) -> np.ndarray:
+def draw_overlay(frame: np.ndarray, stats: dict, cam_label: str,
+                 recording: bool, chamber: str, auto_start: bool) -> np.ndarray:
     if frame.ndim == 2:
         display = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
     else:
         display = frame.copy()
 
-    buffered = stats["buffered_frames"]
-    total    = stats["total_frames"]
-    fps      = stats["fps"]
+    fps   = stats.get("fps", 0.0)
+    total = stats.get("total_frames", 0)
 
-    rec_text = "● REC" if recording else "○ PREVIEW"
+    rec_text  = "● REC" if recording else "○ PREVIEW"
+    mode_text = f"MODE: {'AUTO' if auto_start else 'MANUAL/TTL'}"
     lines = [
         cam_label,
         rec_text,
-        f"FPS      : {fps:6.2f}",
-        f"Frames   : {total:>8,}",
-        f"Buffered : {buffered:>8,}",
+        mode_text,
+        f"Chamber : {chamber}",
+        f"FPS     : {fps:6.2f}",
+        f"Frames  : {total:>8,}",
     ]
 
-    text_color = (0, 255, 255) if buffered < 50 else (0, 80, 255)
-    rec_color  = (0, 0, 255)   if recording      else (180, 180, 180)
-
+    rec_color  = (0, 0, 255) if recording else (180, 180, 180)
+    text_color = (0, 255, 255)
     font       = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.55
-    thickness  = 1
-    line_h     = 22
+    scale      = 0.52
+    thick      = 1
+    line_h     = 20
     pad        = 8
 
-    max_w = max(cv2.getTextSize(l, font, font_scale, thickness)[0][0] for l in lines)
+    max_w = max(cv2.getTextSize(l, font, scale, thick)[0][0] for l in lines)
     box_h = line_h * len(lines) + pad
     box_w = max_w + pad * 2
 
-    overlay = display.copy()
-    cv2.rectangle(overlay, (0, 0), (box_w, box_h), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.55, display, 0.45, 0, display)
+    ov = display.copy()
+    cv2.rectangle(ov, (0, 0), (box_w, box_h), (0, 0, 0), -1)
+    cv2.addWeighted(ov, 0.55, display, 0.45, 0, display)
 
     for i, line in enumerate(lines):
         y = pad + (i + 1) * line_h - 4
-        if   i == 0: color = (255, 255, 255)
-        elif i == 1: color = rec_color
-        else:        color = text_color
-        cv2.putText(display, line, (pad, y), font, font_scale,
-                    color, thickness, cv2.LINE_AA)
+        color = (255, 255, 255) if i == 0 else (rec_color if i == 1 else text_color)
+        cv2.putText(display, line, (pad, y), font, scale, color, thick, cv2.LINE_AA)
 
-    # Bottom hint bar
-    hint = "R: start/stop rec"
-    if ttl_enabled:
-        hint += "  |  TTL: armed"
     h, w = display.shape[:2]
-    hint_y = h - 10
-    cv2.putText(display, hint, (pad, hint_y), font, 0.45,
-                (120, 120, 120), 1, cv2.LINE_AA)
+    hint = "R: start/stop rec  |  ESC: quit"
+    cv2.putText(display, hint, (pad, h - 8), font, 0.40,
+                (100, 100, 100), 1, cv2.LINE_AA)
 
     return display
 
@@ -817,44 +783,30 @@ def draw_stats_overlay(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def print_device_info(nodemap, cam_name: str) -> bool:
-    print(f"\nDevice information for {cam_name}:")
+def print_device_info(nodemap, cam_name: str):
+    print(f"\nDevice info for {cam_name}:")
     try:
-        node_device_information = PySpin.CCategoryPtr(
-            nodemap.GetNode("DeviceInformation")
-        )
-        if PySpin.IsAvailable(node_device_information) and PySpin.IsReadable(
-            node_device_information
-        ):
-            for feature in node_device_information.GetFeatures():
-                node_feature = PySpin.CValuePtr(feature)
-                print(
-                    f"  {node_feature.GetName()}: "
-                    + (
-                        node_feature.ToString()
-                        if PySpin.IsReadable(node_feature)
-                        else "Node not readable"
-                    )
-                )
-        return True
+        di = PySpin.CCategoryPtr(nodemap.GetNode("DeviceInformation"))
+        if PySpin.IsAvailable(di) and PySpin.IsReadable(di):
+            for feat in di.GetFeatures():
+                nf = PySpin.CValuePtr(feat)
+                val = nf.ToString() if PySpin.IsReadable(nf) else "n/a"
+                print(f"  {nf.GetName()}: {val}")
     except PySpin.SpinnakerException as ex:
         print(f"  Error: {ex}")
-        return False
 
 
 def get_connected_serials(system: "PySpin.SystemPtr") -> list[dict]:
-    found = []
+    found    = []
     cam_list = system.GetCameras()
     for cam in cam_list:
         tlmap = cam.GetTLDeviceNodeMap()
-        def _read(node_name):
-            n = PySpin.CStringPtr(tlmap.GetNode(node_name))
-            return n.GetValue() if PySpin.IsAvailable(n) and PySpin.IsReadable(n) else "unknown"
-        found.append({
-            "serial": _read("DeviceSerialNumber"),
-            "model":  _read("DeviceModelName"),
-            "vendor": _read("DeviceVendorName"),
-        })
+        def _r(n):
+            node = PySpin.CStringPtr(tlmap.GetNode(n))
+            return node.GetValue() if PySpin.IsAvailable(node) and PySpin.IsReadable(node) else "unknown"
+        found.append({"serial": _r("DeviceSerialNumber"),
+                      "model":  _r("DeviceModelName"),
+                      "vendor": _r("DeviceVendorName")})
     cam_list.Clear()
     return found
 
@@ -863,105 +815,95 @@ def get_connected_serials(system: "PySpin.SystemPtr") -> list[dict]:
 # Setup wizard
 # ---------------------------------------------------------------------------
 
-def run_setup_wizard(system: "PySpin.SystemPtr", output_path: str = "config.yaml"):
+def run_setup_wizard(system, output_path="config.yaml"):
     print("\n" + "="*60)
     print("  Camera Acquisition — Setup Wizard")
     print("="*60)
 
     devices = get_connected_serials(system)
     if not devices:
-        print("No cameras detected. Check USB/GigE connections and drivers.")
+        print("No cameras detected.")
         return
 
     print(f"\nFound {len(devices)} camera(s):\n")
     for i, d in enumerate(devices):
-        print(f"  [{i}]  Serial: {d['serial']}   Model: {d['model']}   Vendor: {d['vendor']}")
+        print(f"  [{i}]  Serial: {d['serial']}   Model: {d['model']}")
 
-    print("\nEnter camera indices to include (comma-separated) or press Enter for all:")
-    raw = input("  > ").strip()
+    raw      = input("\nCamera indices to include (Enter = all): ").strip()
     selected = list(range(len(devices))) if not raw else [int(x) for x in raw.split(",")]
 
-    cameras_cfg = {}
+    cameras_cfg  = {}
+    chambers_cfg = {}
+
     for i in selected:
-        d = devices[i]
-        default_name = f"cam{i}"
-        print(f"\nCamera {i}  (serial {d['serial']}, {d['model']})")
-        name    = input(f"  Friendly name [{default_name}]: ").strip() or default_name
-        chamber = input(f"  Chamber/arena label []: ").strip()
+        d    = devices[i]
+        name = input(f"\nCam {i} ({d['serial']}) friendly name [cam{i}]: ").strip() or f"cam{i}"
+        ch   = input(f"  Chamber label for cam{i} (e.g. A1): ").strip() or f"chamber_{i}"
+
         cameras_cfg[f"cam{i}"] = {
             "serial":           d["serial"],
             "name":             name,
-            "chamber":          chamber,
+            "chamber":          ch,
             "enabled":          True,
             "exposure_us":      14000,
             "gain_db":          10,
             "black_level":      2.0,
             "throughput_limit": 90_000_000,
         }
+        chambers_cfg[ch] = {
+            "camera": f"cam{i}",
+            "ttl": {
+                "port":            input(f"  Serial port for {ch} TTL [COM1]: ").strip() or "COM1",
+                "baud":            115200,
+                "command":         105,
+                "pin":             0,
+                "polarity":        1,
+                "poll_interval_ms": 10,
+                "label":           ch,
+            }
+        }
 
-    print("\nSave directory for recordings [./recordings]: ", end="")
-    save_dir = input().strip() or "./recordings"
+    save_dir = input("\nSave directory [./recordings]: ").strip() or "./recordings"
 
     config = {
         "save_dir": save_dir,
         "cameras":  cameras_cfg,
+        "chambers": chambers_cfg,
+        "acquisition": {
+            "auto_start": False,
+        },
         "recording": {
             "fps":           59.99,
             "jpeg_quality":  90,
             "split_size_mb": None,
         },
         "roi": {
-            "width":    1020,
-            "height":   1020,
-            "offset_x": 0,
-            "offset_y": 0,
+            "width": 1020, "height": 1020,
+            "offset_x": 0, "offset_y": 0,
         },
         "trigger": {
-            "enabled":    False,
-            "line":       "Line0",
+            "enabled": False, "line": "Line0",
             "activation": "RisingEdge",
-            "selector":   "AcquisitionStart",
+            "selector": "AcquisitionStart",
             "timeout_ms": 5000,
         },
-        "preview": {
-            "enabled":    True,
-            "downsample": 1,
-        },
+        "preview":  {"enabled": True, "downsample": 1},
         "metadata": {
-            "enabled":         True,
-            "save_framecount": True,
-            "save_timestamp":  True,
-            "save_sestime":    True,
-            "save_cputime":    True,
-        },
-        # Morelia TTL — PC-side polling (separate from camera hardware trigger)
-        "morelia_ttl": {
-            "enabled":           False,
-            "port":              "COM1",
-            "baud":              115200,
-            "command":           105,
-            "pin":               0,
-            "polarity":          1,
-            "poll_interval_ms":  10,
+            "enabled": True, "save_framecount": True,
+            "save_timestamp": True, "save_sestime": True, "save_cputime": True,
         },
         "experiment_metadata": {
-            "experimenter_name":         "",
-            "experiment_name":           "",
-            "animal_id":                 "",
-            "genotype":                  "",
-            "group":                     "",
-            "schedule_name":             "",
-            "eeg_fiber_photometry_path": "",
-            "notes":                     "",
+            "experimenter_name": "", "experiment_name": "",
+            "animal_id": "", "genotype": "", "group": "",
+            "schedule_name": "", "eeg_fiber_photometry_path": "", "notes": "",
         },
     }
 
     with open(output_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-
-    print(f"\nConfig written to: {os.path.abspath(output_path)}")
-    print("Run acquisition with:  python multiAcquisition.py -c config.yaml\n")
-    print("Open the GUI with:     python config.py -c config.yaml\n")
+    print(f"\nConfig → {os.path.abspath(output_path)}")
+    print("Run:  python multiAcquisition.py -c config.yaml")
+    print("GUI:  python config.py -c config.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -969,7 +911,7 @@ def run_setup_wizard(system: "PySpin.SystemPtr", output_path: str = "config.yaml
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Multi-camera MJPEG/AVI acquisition.")
+    parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--config", default="config.yaml")
     parser.add_argument("--setup", action="store_true")
     args = parser.parse_args()
@@ -979,13 +921,12 @@ def main():
     print(f"Spinnaker {version.major}.{version.minor}.{version.type}.{version.build}")
 
     if args.setup:
-        run_setup_wizard(system, output_path=args.config)
+        run_setup_wizard(system, args.config)
         system.ReleaseInstance()
         return
 
     if not os.path.isfile(args.config):
-        print(f"Config file not found: {args.config}")
-        print("Tip: run  python multiAcquisition.py --setup  to generate one.")
+        print(f"Config not found: {args.config}")
         system.ReleaseInstance()
         return
 
@@ -1001,53 +942,87 @@ def main():
     streamer._init_cameras()
     streamer._start_threads()
 
-    # Start Morelia TTL listener (no-op if disabled in config)
-    ttl_cfg      = config.get("morelia_ttl", {})
-    ttl_listener = TTLListener(ttl_cfg)
-    ttl_listener.start()
-    ttl_enabled = ttl_cfg.get("enabled", False)
+    # Build chamber → camera map and start one TTL listener per chamber
+    chambers_cfg = config.get("chambers", {})
+    # shared event queue between all listeners; main loop routes by chamber
+    ttl_dispatch_queue: queue.Queue = queue.Queue()
+
+    listeners: list[ChamberTTLListener] = []
+    chamber_to_cam: dict[str, str] = {}
+
+    for chamber_name, ch_cfg in chambers_cfg.items():
+        cam_key = ch_cfg.get("camera")
+        if not cam_key or cam_key not in streamer.cam_names:
+            print(f"[Warning] Chamber {chamber_name} maps to unknown camera {cam_key!r} — skipped.")
+            continue
+        chamber_to_cam[chamber_name] = cam_key
+
+        listener = ChamberTTLListener(
+            chamber_name   = chamber_name,
+            ttl_cfg        = ch_cfg.get("ttl", {}),
+            event_queue    = ttl_dispatch_queue,
+            session_start  = streamer.session_start,
+        )
+        listener.start()
+        listeners.append(listener)
+
+    # Auto-start toggle
+    acq_cfg    = config.get("acquisition", {})
+    auto_start = acq_cfg.get("auto_start", False)
+
+    if auto_start:
+        print("[Main] Auto-start enabled — beginning recording immediately.")
+        streamer.start_all_recording()
 
     preview_enabled = config.get("preview", {}).get("enabled", True)
     print("\nRunning — preview active.")
-    print("  R       : start / stop recording")
-    print("  ESC     : quit\n")
+    print("  R   : start / stop ALL cameras")
+    print("  ESC : quit\n")
 
     try:
         while True:
+            # --- Preview ---
             if preview_enabled:
                 for name in streamer.cam_names:
                     frame = streamer.get_preview(name)
                     if frame is not None:
-                        label   = config["cameras"][name].get("name", name)
+                        cam_cfg = config["cameras"][name]
+                        label   = cam_cfg.get("name", name)
+                        chamber = cam_cfg.get("chamber", "")
                         stats   = streamer.get_stats(name)
-                        display = draw_stats_overlay(
+                        display = draw_overlay(
                             frame, stats, label,
-                            streamer.is_recording, ttl_enabled
+                            streamer.is_recording(name),
+                            chamber, auto_start,
                         )
                         cv2.imshow(label, display)
 
             key = cv2.waitKey(20) & 0xFF
 
-            # R — manual record toggle
-            if key == ord("r") or key == ord("R"):
-                if streamer.is_recording:
-                    streamer.stop_recording()
+            # R — manual toggle all cameras
+            if key in (ord("r"), ord("R")):
+                if streamer.any_recording():
+                    streamer.stop_all_recording()
                 else:
-                    streamer.start_recording()
+                    streamer.start_all_recording()
 
-            # ESC — quit
             if key == 27:
                 break
 
-            # TTL trigger check (non-blocking)
-            if ttl_enabled and not streamer.is_recording:
-                if ttl_listener.wait_for_trigger(timeout=0):
-                    print("[Main] TTL trigger received — starting recording.")
-                    streamer.start_recording()
+            # --- Route TTL events from all chambers ---
+            while not ttl_dispatch_queue.empty():
+                try:
+                    evt = ttl_dispatch_queue.get_nowait()
+                    cam_key = chamber_to_cam.get(evt.chamber)
+                    if cam_key:
+                        streamer.route_ttl_event(evt, cam_key)
+                except queue.Empty:
+                    break
 
     finally:
         streamer.stop()
-        ttl_listener.stop()
+        for lst in listeners:
+            lst.stop()
         if preview_enabled:
             cv2.destroyAllWindows()
         cam_list = system.GetCameras()
