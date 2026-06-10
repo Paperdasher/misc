@@ -15,7 +15,7 @@ Some feature highlights are listed below:
 
 ## Installation
 
-Refer to the following for installing the spinnaker pyspin wheel on your computer: ![Teledyne Guide](https://www.teledynevisionsolutions.com/support/support-center/technical-guidance/iis/installing-pyspin-for-the-spinnaker-sdk/)
+Refer to the following for installing the spinnaker pyspin wheel on your computer: [Teledyne Guide](https://www.teledynevisionsolutions.com/support/support-center/technical-guidance/iis/installing-pyspin-for-the-spinnaker-sdk/)
 
 This application uses Python 3.10, therefore the PySpin installed from Teledyne must be of the same version for compatibility. Make sure your installed Python is also 3.10. 
 
@@ -26,7 +26,7 @@ Unzip the folder and open up a terminal. Change directories to where the folder 
 Ex. Folder located in 'Downloads/code/multiAcq'
 
 ```bash
-$ cd Downloads/code/multiAcq
+cd Downloads/code/multiAcq
 ```
 
 Install other required pip installs via the following command:
@@ -46,9 +46,13 @@ First run the `config.py` file to configure your cameras and map them to specifi
 
 Fill out the experiment info and confirm the settings/serial number for each camera in the Cameras tab. 
 
-This application allows for recording individual chambers. To record a specific chamber, turn the "Record this chamber" toggle on in the configuration GUI for the specific chamber. There is also an option to stop recording after a certain duration. If you want the recording to be a set duration and automatically stop at that point, turn the "Stop recording after" toggle on and set the duration(in seconds) to the desired length. By default the toggle is off. 
+To make a new chamber, go to the Chamber_TTL tab and name the chamber. Click "+ Add Chamber" and make sure to map the correct camera and Arduino connection port to the chamber. 
 
-For automatically starting recording once the acqusition script is run, turn on the "Auto-start recording when script launches" toggle in the Recordings/ROI tab.
+This application allows for recording individual chambers. To record a specific chamber, turn the "Record this chamber" toggle on. There is also an option to stop recording after a certain duration. If you want the recording to be a set duration and automatically stop at that point, turn the "Stop recording after" toggle on and set the duration(in seconds) to the desired length. By default the toggle is off. Check the baud rate for the Arduino and select the corresponding rate in the dropdown selection. If 
+
+For automatically starting recording once the acqusition script is run, turn on the "Auto-start recording when script 
+launches" toggle in the Recordings/ROI tab.
+
 
 Once finished with the configuration, make sure to save the configuration file. We recommend you first to save a general configuration file that maps the cameras to chambers, then using the browse feature to amend components specific to your experiment and save a new config file. Make sure to save the config file in the same folder as the scripts.
 
@@ -58,13 +62,13 @@ Once finished with the configuration, make sure to save the configuration file. 
 To have a preview window showing a live feed of all chambers, run the `preview.py` script using the following command:
 
 ```
-$ python preview.py -c <config file name>.yaml
+python preview.py -c <config file name>.yaml
 ```
 
 To downsample the preview feed quality, use the following command:
 
 ```
-$ python preview.py -c config.yaml --scale 0.5 //change scale accordingly
+python preview.py -c config.yaml --scale 0.5 # change scale accordingly
 ```
 
 This preview window is independent of recording. This preview can be manually terminated by pressing ESC or Q when on the preview window(make sure screen is not on the recording stats window).
@@ -89,3 +93,4 @@ You may end the recording at any time manually by pressing the X key if stopping
 
 This application was used for the BFS-U3-16S2M-CS USB 3.1 Blackfly® S, Monochrome Camera by Teledyne FLIR and was also tested with the ______ camera as well. Spinnaker 3.2.0.62 (64bit) was used. 
 
+Last edited June 2026. 
