@@ -17,13 +17,13 @@ Some feature highlights are listed below:
 
 Refer to the following for installing the spinnaker pyspin wheel on your computer: [Teledyne Guide](https://www.teledynevisionsolutions.com/support/support-center/technical-guidance/iis/installing-pyspin-for-the-spinnaker-sdk/)
 
-This application uses Python 3.10, therefore the PySpin installed from Teledyne must be of the same version for compatibility. Make sure your installed Python is also 3.10. 
+This application uses <b>Python 3.10</b>, therefore the PySpin installed from Teledyne must be of the same version for compatibility. Make sure your installed Python is also 3.10. 
 
 Download this repo by clicking the green code button and clicking 'Download ZIP.'
 
 Unzip the folder and open up a terminal. Change directories to where the folder is located.
 
-Ex. Folder located in 'Downloads/code/multiAcq'
+Ex. Folder located in `Downloads/code/multiAcq`
 
 ```bash
 cd Downloads/code/multiAcq
@@ -34,6 +34,8 @@ Install other required pip installs via the following command:
 ```bash
 pip install -r requirements.txt
 ```
+
+---
 
 ## Using the program
 
@@ -87,10 +89,10 @@ Recordings for all chambers selected in the configuration can be started by pres
 
 You may end the recording at any time manually by pressing the X key if stopping all recordings or individual buttons in the stats popup window for individual chambers.
 
-
+---
 
 ## Notes
 
-This application was used for the BFS-U3-16S2M-CS USB 3.1 Blackfly® S, Monochrome Camera by Teledyne FLIR and was also tested with the ______ camera as well. Spinnaker 3.2.0.62 (64bit) was used. 
+This application was used for the BFS-U3-16S2M-CS USB 3.1 Blackfly® S, Monochrome Camera by Teledyne FLIR and was also tested with the ______ camera as well. <b>Spinnaker 3.2.0.62 (64bit)</b> was installed. 
 
 Last edited June 2026. 
