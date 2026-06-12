@@ -250,8 +250,6 @@ def draw_preview_overlay(frame: np.ndarray, label: str, chamber: str,
         label,
         f"Chamber : {chamber}",
         f"FPS     : {fps:6.2f}",
-        f"Frames  : {total:>8,}",
-        "PREVIEW ONLY — no recording",
     ]
 
     font   = cv2.FONT_HERSHEY_SIMPLEX

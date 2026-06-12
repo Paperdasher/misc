@@ -7,7 +7,7 @@ This application uses the Spinnaker PySpin to continuously acquire videos of mul
 Some feature highlights are listed below:
 
 - Select to record certain but not all chambers
-- Preview all chambers separately from any recording
+- Preview all chambers without recording
 - Recording video stats(FPS, buffer, duration left for timed recordings)
 - Acquisition configuration GUI
 - Logging frame, computer time, TTL event for each chamber
@@ -70,7 +70,7 @@ python preview.py -c <config file name>.yaml
 To downsample the preview feed quality, use the following command:
 
 ```
-python preview.py -c config.yaml --scale 0.5 # change scale accordingly
+python preview.py -c config.yaml --scale 0.5 ## change scale accordingly
 ```
 
 This preview window is independent of recording. This preview can be manually terminated by pressing ESC or Q when on the preview window(make sure screen is not on the recording stats window).
@@ -78,8 +78,19 @@ This preview window is independent of recording. This preview can be manually te
 
 ### Recording chambers
 
+Recordings will be acquired in mjpg format and converted to an avi file at the end. 
 
+The timestamp CSV will include the following details:
+- Frame count: which corresponding frame in the recording
+- Computer/CPU time: timestamp of the computer running the script
+- Camera time: timestamp from the Blackfly camera
+- TTL: any TTL input detected at that frame
+- 
+They are all indexed by the frame count.
 
+The metadata CSV will include the experiment information from the inputs provided in the configuration file(experiment tab of GUI). Additionally, it will give the start and end time of the experiment(from the computer timestamp), total TTL pulses received, the path of the video recording, path of the timestamp CSV, number of frames dropped. 
+
+All files will be in its own experiment folder named by the datetime_computerName_chamber#
 
 ### Manual start/stop
 
@@ -93,6 +104,9 @@ You may end the recording at any time manually by pressing the X key if stopping
 
 ## Notes
 
-This application was used for the BFS-U3-16S2M-CS USB 3.1 Blackfly® S, Monochrome Camera by Teledyne FLIR and was also tested with the ______ camera as well. <b>Spinnaker 3.2.0.62 (64bit)</b> was installed. 
+This application was used for the BFS-U3-16S2M-CS USB 3.1 Blackfly® S, Monochrome Camera by Teledyne FLIR and was also tested with the ______ camera as well. <b>Spinnaker 3.2.0.62 (64bit)</b> was installed. The [DB15 Female 15-Pin to Screw Terminal Breakout Board Adapter](https://www.amazon.com/Oiyagai-Terminal-Connector-Signal-Module/dp/B07DCM5FDC?th=1) as the breakout board for the TTLs along with the [Arduino Mega 2560 Rev3](https://store-usa.arduino.cc/products/arduino-mega-2560-rev3?utm_source=google&utm_medium=cpc&utm_campaign=US-Pmax&gad_source=1&gad_campaignid=21317508903&gbraid=0AAAAACbEa86z88u0HLKYAbVZZ1xwL9vR2&gclid=Cj0KCQjwlqTRBhCBARIsANrkrxgfqTqLVhNS9Avx6jZU1In4YGmlsE1hOzoSp5ggkfSmArEuNoXtYBcaAqA8EALw_wcB) for multiple chambers and the [Arduino Uno Rev3 SMD](https://store-usa.arduino.cc/collections/uno/products/arduino-uno-rev3-smd) for one chamber.
+
+We recommend ___ GB of RAM per camera connected to the computer. We found around 2GB of CPU, ____ RAM, and 1.2GB of GPU used when recording using two cameras through a ______ chip computer.
+
 
 Last edited June 2026. 
