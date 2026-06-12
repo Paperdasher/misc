@@ -2,14 +2,19 @@
 preview.py — Live camera preview (no recording)
 ================================================
 Minimal script: reads only cameras + chambers from config.yaml.
-Shows a live OpenCV preview window for every enabled camera.
-No acquisition, no TTL, no file writing.
+Shows all cameras in ONE resizable window, tiled automatically:
+
+    1 camera  → full window
+    2 cameras → side by side
+    3 cameras → left column + right column (top + bottom)
+    4 cameras → 2×2 grid
+
+Window is resizable — drag the corner freely.
 
 Usage
 -----
     python preview.py -c config.yaml
-    python preview.py -c config.yaml --scale 0.5   # downsample display
-    python preview.py --setup                       # auto-detect cameras, write minimal config
+    python preview.py --setup     # auto-detect cameras, write minimal config
 
 Config needed (subset of full config.yaml)
 ------------------------------------------
@@ -24,12 +29,11 @@ Config needed (subset of full config.yaml)
         black_level: 2.0
         throughput_limit: 90000000
 
-    # Optional — shown in overlay but not required
-    chambers:
+    chambers:            # optional — shown in overlay
       chamber_A:
         camera: cam0
 
-Keys under recording/trigger/metadata are all ignored.
+Keys under recording/trigger/metadata are ignored.
 
 Press ESC or Q to quit.
 """
@@ -232,46 +236,107 @@ class PreviewStreamer:
 
 
 # ---------------------------------------------------------------------------
-# Overlay
+# Per-tile overlay
 # ---------------------------------------------------------------------------
 
-def draw_preview_overlay(frame: np.ndarray, label: str, chamber: str,
-                          fps: float, total: int, scale: float) -> np.ndarray:
-    if frame.ndim == 2:
-        display = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-    else:
-        display = frame.copy()
-
-    if scale != 1.0:
-        h, w = display.shape[:2]
-        display = cv2.resize(display, (int(w * scale), int(h * scale)))
+def draw_tile_overlay(frame: np.ndarray, label: str, chamber: str,
+                      fps: float, total: int) -> np.ndarray:
+    """Burn a compact HUD into one camera tile (already BGR)."""
+    display = frame.copy()
 
     lines = [
         label,
-        f"Chamber : {chamber}",
-        f"FPS     : {fps:6.2f}",
+        f"{chamber}",
+        f"FPS {fps:5.1f}",
+        "PREVIEW",
     ]
 
-    font   = cv2.FONT_HERSHEY_SIMPLEX
-    sc, th = 0.50, 1
-    lh, pad = 19, 7
-    max_w  = max(cv2.getTextSize(l, font, sc, th)[0][0] for l in lines)
-    box_h  = lh * len(lines) + pad
-    box_w  = max_w + pad * 2
+    font  = cv2.FONT_HERSHEY_SIMPLEX
+    sc    = 0.45
+    th    = 1
+    lh    = 17
+    pad   = 5
+
+    max_w = max(cv2.getTextSize(l, font, sc, th)[0][0] for l in lines)
+    box_h = lh * len(lines) + pad
+    box_w = max_w + pad * 2
 
     ov = display.copy()
     cv2.rectangle(ov, (0, 0), (box_w, box_h), (0, 0, 0), -1)
     cv2.addWeighted(ov, 0.55, display, 0.45, 0, display)
 
-    colors = [(255,255,255), (0,255,255), (0,255,255), (0,255,255), (80,80,200)]
+    colors = [(255, 255, 255), (0, 220, 220), (0, 220, 220), (70, 70, 180)]
     for i, line in enumerate(lines):
-        y = pad + (i + 1) * lh - 3
+        y = pad + (i + 1) * lh - 2
         cv2.putText(display, line, (pad, y), font, sc, colors[i], th, cv2.LINE_AA)
 
-    h, w = display.shape[:2]
-    cv2.putText(display, "ESC / Q : quit", (pad, h - 8),
-                font, 0.38, (80, 80, 80), 1, cv2.LINE_AA)
     return display
+
+
+# ---------------------------------------------------------------------------
+# Tiled compositor
+# ---------------------------------------------------------------------------
+
+def tile_frames(frames: list[np.ndarray], win_w: int, win_h: int) -> np.ndarray:
+    """
+    Arrange up to 4 BGR frames into a single canvas of size win_w × win_h.
+
+    Layout:
+        1 cam  → full canvas
+        2 cams → left | right
+        3 cams → left | right-top
+                       | right-bottom
+        4 cams → TL | TR
+                 BL | BR
+    """
+    n = len(frames)
+    canvas = np.zeros((win_h, win_w, 3), dtype=np.uint8)
+
+    def _fit(img: np.ndarray, tw: int, th: int) -> np.ndarray:
+        """Scale img to fit inside tw×th, preserving aspect ratio, centered."""
+        h, w = img.shape[:2]
+        scale = min(tw / w, th / h)
+        nw, nh = int(w * scale), int(h * scale)
+        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        out = np.zeros((th, tw, 3), dtype=np.uint8)
+        y0 = (th - nh) // 2
+        x0 = (tw - nw) // 2
+        out[y0:y0 + nh, x0:x0 + nw] = resized
+        return out
+
+    def _place(img: np.ndarray, x: int, y: int, w: int, h: int):
+        tile = _fit(img, w, h)
+        canvas[y:y + h, x:x + w] = tile
+
+    if n == 1:
+        _place(frames[0], 0, 0, win_w, win_h)
+
+    elif n == 2:
+        hw = win_w // 2
+        _place(frames[0], 0,  0, hw, win_h)
+        _place(frames[1], hw, 0, win_w - hw, win_h)
+        cv2.line(canvas, (hw, 0), (hw, win_h), (40, 40, 40), 1)
+
+    elif n == 3:
+        hw  = win_w // 2
+        hh  = win_h // 2
+        _place(frames[0], 0,  0,   hw,          win_h)
+        _place(frames[1], hw, 0,   win_w - hw,  hh)
+        _place(frames[2], hw, hh,  win_w - hw,  win_h - hh)
+        cv2.line(canvas, (hw, 0),  (hw, win_h),   (40, 40, 40), 1)
+        cv2.line(canvas, (hw, hh), (win_w, hh),   (40, 40, 40), 1)
+
+    else:   # 4
+        hw = win_w // 2
+        hh = win_h // 2
+        _place(frames[0], 0,  0,  hw,         hh)
+        _place(frames[1], hw, 0,  win_w - hw, hh)
+        _place(frames[2], 0,  hh, hw,         win_h - hh)
+        _place(frames[3], hw, hh, win_w - hw, win_h - hh)
+        cv2.line(canvas, (hw, 0),  (hw, win_h),  (40, 40, 40), 1)
+        cv2.line(canvas, (0, hh),  (win_w, hh),  (40, 40, 40), 1)
+
+    return canvas
 
 
 # ---------------------------------------------------------------------------
@@ -331,10 +396,8 @@ def run_setup_wizard(system, output_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Live camera preview — no recording.")
-    parser.add_argument("-c", "--config",  default="config.yaml")
-    parser.add_argument("--scale",  type=float, default=1.0,
-                        help="Display scale factor (e.g. 0.5 = half size)")
-    parser.add_argument("--setup",  action="store_true",
+    parser.add_argument("-c", "--config", default="config.yaml")
+    parser.add_argument("--setup", action="store_true",
                         help="Auto-detect cameras and write a minimal preview config")
     args = parser.parse_args()
 
@@ -353,7 +416,7 @@ def main():
         system.ReleaseInstance()
         return
 
-    config  = load_config(args.config)
+    config   = load_config(args.config)
     streamer = PreviewStreamer(config, system)
 
     try:
@@ -365,30 +428,59 @@ def main():
 
     streamer.start()
 
-    # Build chamber label lookup
-    chambers_cfg  = config.get("chambers", {})
+    # Chamber lookup: camera key → chamber name
+    chambers_cfg   = config.get("chambers", {})
     cam_to_chamber = {
         ch_cfg.get("camera", ""): ch_name
         for ch_name, ch_cfg in chambers_cfg.items()
     }
 
-    print(f"\nPreviewing {len(streamer.cam_names)} camera(s).  ESC or Q to quit.\n")
+    n_cams = len(streamer.cam_names)
+    print(f"\nPreviewing {n_cams} camera(s) in one window.  ESC or Q to quit.\n")
+
+    WIN_NAME = "Preview"
+    cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+    # Sensible default size; user can resize freely
+    default_w = 1280 if n_cams <= 2 else 1280
+    default_h = 480  if n_cams <= 2 else 960
+    cv2.resizeWindow(WIN_NAME, default_w, default_h)
 
     try:
         while True:
+            # --- Collect BGR tiles, one per camera ---
+            tiles = []
             for name in streamer.cam_names:
                 frame = streamer.get_frame(name)
                 if frame is None:
+                    # Placeholder while camera warms up
+                    tiles.append(np.zeros((480, 640, 3), dtype=np.uint8))
                     continue
+
+                # Convert to BGR
+                if frame.ndim == 2:
+                    bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                else:
+                    bgr = frame.copy()
+
                 cam_cfg = config["cameras"][name]
                 label   = cam_cfg.get("name", name)
                 chamber = cam_to_chamber.get(name, cam_cfg.get("chamber", ""))
                 stats   = streamer.get_stats(name)
-                display = draw_preview_overlay(
-                    frame, label, chamber,
-                    stats["fps"], stats["total"], args.scale
-                )
-                cv2.imshow(label, display)
+                bgr     = draw_tile_overlay(bgr, label, chamber,
+                                            stats["fps"], stats["total"])
+                tiles.append(bgr)
+
+            # --- Get current window size so tiling respects user resizes ---
+            try:
+                _, _, win_w, win_h = cv2.getWindowImageRect(WIN_NAME)
+                if win_w < 64 or win_h < 64:
+                    win_w, win_h = default_w, default_h
+            except Exception:
+                win_w, win_h = default_w, default_h
+
+            # Cap at 4 tiles for the tiler
+            composite = tile_frames(tiles[:4], win_w, win_h)
+            cv2.imshow(WIN_NAME, composite)
 
             key = cv2.waitKey(20) & 0xFF
             if key in (27, ord("q"), ord("Q")):

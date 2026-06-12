@@ -146,10 +146,16 @@ class MetadataTab(QWidget):
         self.experiment_name = QLineEdit(); self.experiment_name.setPlaceholderText("e.g. Cohort1")
         self.session_date    = QLineEdit(date.today().strftime("%Y-%m-%d"))
         self.schedule_name   = QLineEdit(); self.schedule_name.setPlaceholderText("e.g. FR5")
+        self.pc_name         = QLineEdit()
+        self.pc_name.setPlaceholderText("leave blank to use system hostname automatically")
         g.addWidget(lbl("Experimenter"),    0,0); g.addWidget(self.experimenter,    0,1)
         g.addWidget(lbl("Experiment Name"), 0,2); g.addWidget(self.experiment_name, 0,3)
         g.addWidget(lbl("Date"),            1,0); g.addWidget(self.session_date,    1,1)
         g.addWidget(lbl("Schedule Name"),   1,2); g.addWidget(self.schedule_name,   1,3)
+        g.addWidget(lbl("PC / Station Name"),2,0); g.addWidget(self.pc_name,        2,1,1,3)
+        g.addWidget(note("Optional — overrides the auto-detected hostname in session CSV. "
+                         "Useful when multiple PCs run the same script and you need to "
+                         "identify which machine recorded which file."), 3,0,1,4)
         layout.addWidget(id_box)
 
         an_box = QGroupBox("Animal")
@@ -190,6 +196,7 @@ class MetadataTab(QWidget):
         self.genotype.setText(m.get("genotype",""))
         self.group.setText(m.get("group",""))
         self.schedule_name.setText(m.get("schedule_name",""))
+        self.pc_name.setText(m.get("pc_name",""))
         self.eeg_path.setText(m.get("eeg_fiber_photometry_path",""))
         self.notes.setPlainText(m.get("notes",""))
 
@@ -201,6 +208,7 @@ class MetadataTab(QWidget):
             "genotype":                  self.genotype.text().strip(),
             "group":                     self.group.text().strip(),
             "schedule_name":             self.schedule_name.text().strip(),
+            "pc_name":                   self.pc_name.text().strip(),
             "eeg_fiber_photometry_path": self.eeg_path.text().strip(),
             "notes":                     self.notes.toPlainText().strip(),
         }
@@ -295,7 +303,7 @@ class ArduinoSigWidget(QGroupBox):
         self.port = QLineEdit(cfg.get("port", "COM3"))
         self.port.setPlaceholderText("e.g. COM3 or /dev/ttyUSB0")
         self.scan_btn = QPushButton("Scan ports")
-        self.scan_btn.setFixedWidth(150)
+        self.scan_btn.setFixedWidth(90)
         self.scan_btn.clicked.connect(self._scan)
         self._scan_lbl = QLabel(""); self._scan_lbl.setObjectName("note")
 
@@ -433,7 +441,7 @@ class ChambersTab(QWidget):
         tl.setContentsMargins(12,8,12,4)
         self._new_key_edit = QLineEdit()
         self._new_key_edit.setPlaceholderText("New chamber key, e.g. chamber_B")
-        self._new_key_edit.setFixedWidth(400)
+        self._new_key_edit.setFixedWidth(220)
         add_btn = QPushButton("+ Add Chamber")
         add_btn.clicked.connect(self._add_from_field)
         tl.addWidget(lbl("Key:")); tl.addWidget(self._new_key_edit)

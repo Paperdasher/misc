@@ -47,7 +47,7 @@ Config (chambers block)
         timer_enabled: false
         duration_s: 1800
         arduino:
-          port: COM1          # serial port the Arduino is on
+          port: COM3          # serial port the Arduino is on
           baud: 115200
           chamber_id: chamber_A   # must match what the sketch sends
 
@@ -229,12 +229,13 @@ class CameraWriter:
 
         os.makedirs(chamber_dir, exist_ok=True)
 
-        label          = cam_cfg.get("name", cam_name)
-        ts             = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base           = f"{label}_{ts}"
+        cam_label  = cam_cfg.get("name", cam_name)
+        ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Filename includes chamber ID + camera name + timestamp for unambiguous identification
+        base            = f"{chamber_name}_{cam_label}_{ts}"
         self.video_path = os.path.join(chamber_dir, f"{base}.avi")
         self.ts_path    = os.path.join(chamber_dir, f"{base}_timestamps.csv")
-        self.label      = label
+        self.label      = cam_label
 
         self._fq          = queue.Queue()
         self._stop        = threading.Event()
@@ -532,10 +533,13 @@ class CameraStreamer:
         if not self.metadata_cfg.get("enabled", True):
             return
 
+        import socket
+
         label    = self.cam_configs[cam_name].get("name", cam_name)
         ch_name  = self.cam_to_chamber.get(cam_name, cam_name)
-        path     = os.path.join(self.session_dir, ch_name,
-                                f"{writer.label}_session.csv")
+        # Session summary named consistently with the video/timestamps files
+        base     = os.path.splitext(os.path.basename(writer.video_path))[0]
+        path     = os.path.join(self.session_dir, ch_name, f"{base}_session.csv")
         duration = (writer.end_wall - writer.start_wall) if writer.end_wall else 0
         avg_fps  = writer.frame_count / duration if duration > 0 else 0
         start_dt = datetime.fromtimestamp(writer.start_wall)
@@ -543,11 +547,27 @@ class CameraStreamer:
         exp_meta = self.config.get("experiment_metadata", {})
         expected = int(round(self.fps * duration))
 
+        # PC name: prefer config override, fall back to system hostname
+        pc_name = (
+            exp_meta.get("pc_name", "").strip()
+            or self.config.get("pc_name", "").strip()
+            or socket.gethostname()
+        )
+
+        # Chamber number: numeric suffix if key ends in a digit, else the full key
+        ch_num_str = ch_name
+        for part in reversed(ch_name.replace("-", "_").split("_")):
+            if part.isdigit():
+                ch_num_str = part
+                break
+
         fields = {
             "experimenter_name":         exp_meta.get("experimenter_name", ""),
             "experiment_name":           exp_meta.get("experiment_name", ""),
+            "pc_name":                   pc_name,
             "camera_name":               label,
             "chamber":                   ch_name,
+            "chamber_number":            ch_num_str,
             "animal_id":                 exp_meta.get("animal_id", ""),
             "genotype":                  exp_meta.get("genotype", ""),
             "group":                     exp_meta.get("group", ""),
@@ -558,7 +578,8 @@ class CameraStreamer:
             "duration_s":                f"{duration:.3f}",
             "total_frames":              writer.frame_count,
             "frames_dropped":            max(0, expected - writer.frame_count),
-            "avg_sampling_rate_hz":      f"{avg_fps:.4f}",
+            "configured_fps":            f"{self.fps:.4f}",
+            "avg_actual_fps":            f"{avg_fps:.4f}",
             "video_path":                os.path.abspath(writer.video_path),
             "timestamp_file_path":       os.path.abspath(writer.ts_path),
             "eeg_fiber_photometry_path": exp_meta.get("eeg_fiber_photometry_path", ""),
@@ -947,7 +968,7 @@ def run_setup_wizard(system, output_path="config.yaml"):
             "enabled": True, "exposure_us": 14000, "gain_db": 10,
             "black_level": 2.0, "throughput_limit": 90_000_000,
         }
-        port = input(f"  Arduino serial port for {ch} [COM1]: ").strip() or "COM1"
+        port = input(f"  Arduino serial port for {ch} [COM3]: ").strip() or "COM3"
         baud_raw = input(f"  Baud rate [115200]: ").strip()
         baud = int(baud_raw) if baud_raw.isdigit() else 115200
         chambers_cfg[ch] = {
