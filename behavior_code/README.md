@@ -50,7 +50,7 @@ Fill out the experiment info and confirm the settings/serial number for each cam
 
 To make a new chamber, go to the Chamber_TTL tab and name the chamber. Click "+ Add Chamber" and make sure to map the correct camera and Arduino connection port to the chamber. 
 
-This application allows for recording individual chambers. To record a specific chamber, turn the "Record this chamber" toggle on. There is also an option to stop recording after a certain duration. If you want the recording to be a set duration and automatically stop at that point, turn the "Stop recording after" toggle on and set the duration(in seconds) to the desired length. By default the toggle is off. Check the baud rate for the Arduino and select the corresponding rate in the dropdown selection. If 
+This application allows for recording individual chambers. To record a specific chamber, turn the "Record this chamber" toggle on. There is also an option to stop recording after a certain duration. If you want the recording to be a set duration and automatically stop at that point, turn the "Stop recording after" toggle on and set the duration(in seconds) to the desired length. By default the toggle is off. Check the baud rate for the Arduino and select the corresponding rate in the dropdown selection. 
 
 For automatically starting recording once the acqusition script is run, turn on the "Auto-start recording when script 
 launches" toggle in the Recordings/ROI tab.
@@ -61,16 +61,16 @@ Once finished with the configuration, make sure to save the configuration file. 
 
 ### Chamber live feed
 
-To have a preview window showing a live feed of all chambers, run the `preview.py` script using the following command:
+To have a preview window showing a live feed of all chambers, run the `multiAcquisition.py` script using the following command:
 
 ```
-python preview.py -c <config file name>.yaml
+python multiAcquisition.py -c <config file name>.yaml
 ```
 
 To downsample the preview feed quality, use the following command:
 
 ```
-python preview.py -c config.yaml --scale 0.5 ## change scale accordingly
+
 ```
 
 This preview window is independent of recording. This preview can be manually terminated by pressing ESC or Q when on the preview window(make sure screen is not on the recording stats window).
@@ -85,7 +85,7 @@ The timestamp CSV will include the following details:
 - Computer/CPU time: timestamp of the computer running the script
 - Camera time: timestamp from the Blackfly camera
 - TTL: any TTL input detected at that frame
-- 
+- EDIT FOR MORE HEREEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
 They are all indexed by the frame count.
 
 The metadata CSV will include the experiment information from the inputs provided in the configuration file(experiment tab of GUI). Additionally, it will give the start and end time of the experiment(from the computer timestamp), total TTL pulses received, the path of the video recording, path of the timestamp CSV, number of frames dropped. 
