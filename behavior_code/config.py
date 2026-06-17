@@ -278,18 +278,25 @@ class CamerasTab(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Arduino connection widget  (one per chamber)
+# Arduino analog connection widget  (one per chamber)
 # ---------------------------------------------------------------------------
 class ArduinoSigWidget(QGroupBox):
     """
-    Configures the Arduino serial connection for one chamber.
+    Configures the Arduino analog TTL connection for one chamber.
 
-    The Arduino sketch sends:
-        START:<chamber_id>\\n   on rising edge of its digital pin
-        STOP:<chamber_id>\\n    on falling edge
+    Each chamber uses 3 consecutive analog channels on the Arduino sketch
+    (chamber_ttl_analog.ino), numbered sequentially across all chambers
+    starting at 1 (chamber 1 -> TTL 1,2,3; chamber 2 -> TTL 4,5,6; etc).
+    Within a chamber: one TTL number STARTS recording, one STOPS it, and
+    the third (if used) is a spare/unused channel.
 
-    Multiple chambers can share one Arduino (same port, different pins).
-    The chamber_id in the message is what routes the event to the right camera.
+    The script requires 3 consecutive confirmed-high readings of a TTL
+    number before acting — this is fixed in multiAcquisition.py and not
+    configurable here, since it's a noise-filtering safeguard rather than
+    a per-chamber setting.
+
+    Multiple chambers can share one Arduino (same port, different TTL
+    numbers) — just give them the same port and different TTL ranges.
     """
     BAUDS = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
 
@@ -316,27 +323,34 @@ class ArduinoSigWidget(QGroupBox):
         bi = self.baud.findText(str(cfg.get("baud", 115200)))
         if bi >= 0: self.baud.setCurrentIndex(bi)
 
-        # Chamber ID sent by Arduino — defaults to chamber key
-        self.chamber_id = QLineEdit(cfg.get("chamber_id", chamber_key))
-        self.chamber_id.setPlaceholderText("must match what Arduino sends after START:/STOP:")
+        # Board voltage toggle — 5V vs 3.3V, affects threshold in the sketch
+        self.vref = QComboBox()
+        self.vref.addItem("5.0 V  (Uno / Mega / Nano)", 5.0)
+        self.vref.addItem("3.3 V  (Due / Zero / MKR)",  3.3)
+        vref_val = cfg.get("vref", 5.0)
+        for i in range(self.vref.count()):
+            if abs(self.vref.itemData(i) - vref_val) < 0.01:
+                self.vref.setCurrentIndex(i); break
 
-        # Arduino pin — informational only, used when generating sketch
-        self.pin = QSpinBox(); self.pin.setRange(0, 53)
-        self.pin.setValue(cfg.get("pin", 2))
-        self.pin.setToolTip(
-            "Digital pin number on the Arduino wired to this chamber's TTL line.\n"
-            "Used only for sketch generation — not read at runtime."
-        )
+        # Start / Stop TTL channel numbers
+        self.start_ttl = QSpinBox(); self.start_ttl.setRange(1, 999)
+        self.start_ttl.setValue(cfg.get("start_ttl", 1))
+        self.stop_ttl  = QSpinBox(); self.stop_ttl.setRange(1, 999)
+        self.stop_ttl.setValue(cfg.get("stop_ttl", 2))
 
-        g.addWidget(lbl("Port"),           0, 0); g.addWidget(port_row,         0, 1, 1, 3)
-        g.addWidget(self._scan_lbl,        1, 0, 1, 4)
-        g.addWidget(lbl("Baud rate"),      2, 0); g.addWidget(self.baud,         2, 1)
-        g.addWidget(lbl("Arduino pin"),    2, 2); g.addWidget(self.pin,          2, 3)
-        g.addWidget(lbl("Chamber ID"),     3, 0); g.addWidget(self.chamber_id,   3, 1, 1, 3)
+        g.addWidget(lbl("Port"),            0, 0); g.addWidget(port_row,       0, 1, 1, 3)
+        g.addWidget(self._scan_lbl,         1, 0, 1, 4)
+        g.addWidget(lbl("Baud rate"),       2, 0); g.addWidget(self.baud,      2, 1)
+        g.addWidget(lbl("Board voltage"),   2, 2); g.addWidget(self.vref,      2, 3)
+        g.addWidget(lbl("Start TTL #"),     3, 0); g.addWidget(self.start_ttl, 3, 1)
+        g.addWidget(lbl("Stop TTL #"),      3, 2); g.addWidget(self.stop_ttl,  3, 3)
         g.addWidget(note(
-            "Chamber ID must exactly match the string the Arduino sketch sends.\n"
-            "Example sketch message:  Serial.println(\"START:chamber_A\");\n"
-            "Multiple chambers on one Arduino → same port, different chamber IDs and pins."
+            "TTL numbers are sequential across ALL chambers, matching pin order in "
+            "ANALOG_PINS in chamber_ttl_analog.ino (chamber 1 = TTL 1,2,3; chamber 2 = "
+            "TTL 4,5,6; etc). 3 consecutive confirmed-high reads of the Start TTL begins "
+            "recording; 3 consecutive reads of the Stop TTL ends it.\n"
+            "Board voltage must match BOARD_VREF set in the sketch — this only affects "
+            "documentation here; update the sketch constant yourself to match."
         ), 4, 0, 1, 4)
 
     def _scan(self):
@@ -358,15 +372,20 @@ class ArduinoSigWidget(QGroupBox):
         self.port.setText(cfg.get("port", "COM3"))
         bi = self.baud.findText(str(cfg.get("baud", 115200)))
         if bi >= 0: self.baud.setCurrentIndex(bi)
-        self.chamber_id.setText(cfg.get("chamber_id", self._chamber_key))
-        self.pin.setValue(cfg.get("pin", 2))
+        vref_val = cfg.get("vref", 5.0)
+        for i in range(self.vref.count()):
+            if abs(self.vref.itemData(i) - vref_val) < 0.01:
+                self.vref.setCurrentIndex(i); break
+        self.start_ttl.setValue(cfg.get("start_ttl", 1))
+        self.stop_ttl.setValue(cfg.get("stop_ttl", 2))
 
     def dump(self) -> dict:
         return {
-            "port":       self.port.text().strip(),
-            "baud":       int(self.baud.currentText()),
-            "chamber_id": self.chamber_id.text().strip(),
-            "pin":        self.pin.value(),
+            "port":      self.port.text().strip(),
+            "baud":      int(self.baud.currentText()),
+            "vref":      self.vref.currentData(),
+            "start_ttl": self.start_ttl.value(),
+            "stop_ttl":  self.stop_ttl.value(),
         }
 
 
