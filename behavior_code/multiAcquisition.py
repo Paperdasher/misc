@@ -18,15 +18,28 @@ Recording triggers (per chamber)
     Auto-start           → acquisition.auto_start: true in config
     Per-chamber timer    → chambers.<name>.timer_enabled + duration_s
 
-Arduino protocol
-----------------
-    The Arduino sketch monitors one or more digital pins.
-    On a rising edge it sends:   START:<chamber_id>\\n
-    On a falling edge it sends:  STOP:<chamber_id>\\n
+Arduino protocol (analog)
+--------------------------
+    The Arduino sketch (chamber_ttl_analog.ino) reads several analog pins
+    and reports a threshold-crossing state for each, every loop iteration:
 
-    Multiple chambers can share one Arduino (different pins, same port).
-    Multiple Arduinos on different COM ports are also supported —
-    one ArduinoListener thread is started per unique port.
+        TTL:<number>:<state>\\n
+
+    <number> is the sequential TTL channel (1, 2, 3, ...) matching pin
+    order in the sketch's ANALOG_PINS array. <state> is 1 (above
+    threshold) or 0 (below).
+
+    This script requires 3 CONSECUTIVE state=1 reads of the same channel
+    before confirming a trigger — this filters analog noise near the
+    threshold. Each chamber's config specifies which TTL number starts
+    recording (start_ttl) and which stops it (stop_ttl):
+
+        chamber 1 → TTL 1 (start), TTL 2 (stop), TTL 3 (spare)
+        chamber 2 → TTL 4 (start), TTL 5 (stop), TTL 6 (spare)
+
+    Multiple chambers can share one Arduino (one port, multiple analog
+    pins/TTL numbers). Multiple Arduinos on different ports are also
+    supported — one AnalogTTLListener thread per unique port.
 
 Output layout
 -------------
@@ -49,7 +62,9 @@ Config (chambers block)
         arduino:
           port: COM3          # serial port the Arduino is on
           baud: 115200
-          chamber_id: chamber_A   # must match what the sketch sends
+          start_ttl: 1         # TTL channel number that starts recording
+          stop_ttl: 2          # TTL channel number that stops recording
+          vref: 5.0            # 5.0 or 3.3 — informational, set in sketch too
 
 Required
 --------
@@ -73,6 +88,8 @@ import yaml
 import cv2
 import PySpin
 
+from camera_lock import acquire_camera_lock, release_camera_lock, who_holds_lock
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -89,50 +106,73 @@ def load_config(path: str) -> dict:
 
 class TTLEvent:
     def __init__(self, chamber: str, kind: str,
-                 wall: float, sestime: float, label: str):
-        self.chamber = chamber
-        self.kind    = kind   # "start" or "stop"
-        self.wall    = wall
-        self.sestime = sestime
-        self.label   = label
+                 wall: float, sestime: float, label: str,
+                 ttl_number: int = None):
+        self.chamber    = chamber
+        self.kind       = kind   # "start" or "stop" (resolved) or "ttl_active" (raw)
+        self.wall       = wall
+        self.sestime    = sestime
+        self.label      = label
+        self.ttl_number = ttl_number   # raw analog TTL channel number, if applicable
 
 
 # ---------------------------------------------------------------------------
-# Arduino listener  — one per unique serial port
+# Analog TTL listener  — one per unique serial port
 # ---------------------------------------------------------------------------
 
-class ArduinoListener:
+class AnalogTTLListener:
     """
-    Reads newline-terminated messages from one Arduino over serial.
+    Reads numbered analog TTL channel states from one Arduino over serial.
 
-    Expected message format:
-        START:<chamber_id>\\n   → rising edge on that chamber's pin
-        STOP:<chamber_id>\\n    → falling edge
+    Expected message format (sent every loop by the sketch, for every pin):
+        TTL:<number>:<state>\\n
+    where <number> is the sequential TTL channel (1, 2, 3, ...) and
+    <state> is 1 (voltage above threshold) or 0 (below).
 
-    One listener can serve multiple chambers if they share a port
-    (e.g. a single Arduino with multiple pins, each mapped to a different
-    chamber_id).  The listener routes every event to the shared
-    event_queue; main() dispatches by chamber.
+    Confirmation logic
+    -------------------
+    A single high reading is not trusted — analog noise near the threshold
+    can cause spurious blips. This listener requires CONFIRM_COUNT (3)
+    consecutive "active" (state=1) reads of the SAME ttl_number before
+    firing an event. The count resets to zero the moment that channel
+    reads 0 again, so a fired event always corresponds to a clean,
+    sustained voltage crossing.
 
-    If two chambers use different ports, two ArduinoListeners are created.
+    Each TTL number is tracked independently — multiple chambers' TTLs
+    interleave on the same serial stream without interfering with each
+    other's confirmation counters.
+
+    Routing to start/stop is NOT done here — this listener only confirms
+    "TTL channel N just went active" and pushes that as a TTLEvent with
+    kind="ttl_active" and the raw ttl_number. main() maps ttl_number to
+    (chamber, start/stop) using each chamber's configured start_ttl/stop_ttl.
     """
+
+    CONFIRM_COUNT = 3   # consecutive active reads required to confirm
 
     def __init__(self, port: str, baud: int,
                  event_queue: queue.Queue, session_start: float):
-        self.port          = port
-        self.baud          = baud
-        self._eq           = event_queue
+        self.port           = port
+        self.baud           = baud
+        self._eq            = event_queue
         self._session_start = session_start
-        self._stop         = threading.Event()
-        self._thread       = None
+        self._stop          = threading.Event()
+        self._thread        = None
+
+        # Per-ttl-number consecutive active-read counter
+        self._consec: dict[int, int] = {}
+        # Per-ttl-number: have we already fired for this sustained run?
+        # (prevents re-firing every loop while voltage stays high)
+        self._fired: dict[int, bool] = {}
 
     def start(self):
         self._thread = threading.Thread(
             target=self._read_loop, daemon=True,
-            name=f"arduino-{self.port}"
+            name=f"analogttl-{self.port}"
         )
         self._thread.start()
-        print(f"[Arduino] Listening on {self.port} @ {self.baud} baud")
+        print(f"[AnalogTTL] Listening on {self.port} @ {self.baud} baud "
+             f"(confirm after {self.CONFIRM_COUNT} consecutive reads)")
 
     def stop(self):
         self._stop.set()
@@ -143,23 +183,23 @@ class ArduinoListener:
         try:
             import serial
         except ImportError:
-            print(f"[Arduino:{self.port}] pyserial not installed — pip install pyserial")
+            print(f"[AnalogTTL:{self.port}] pyserial not installed — pip install pyserial")
             return
 
         try:
             ser = serial.Serial(
                 port=self.port, baudrate=self.baud,
-                timeout=0.5,        # unblocks every 0.5 s so stop event is checked
+                timeout=0.5,
             )
         except Exception as e:
-            print(f"[Arduino:{self.port}] Cannot open port: {e}")
+            print(f"[AnalogTTL:{self.port}] Cannot open port: {e}")
             return
 
-        print(f"[Arduino:{self.port}] Port open — waiting for events.")
+        print(f"[AnalogTTL:{self.port}] Port open — reading channels.")
         with ser:
             while not self._stop.is_set():
                 try:
-                    raw = ser.readline()          # blocks up to timeout
+                    raw = ser.readline()
                 except Exception:
                     break
 
@@ -171,37 +211,49 @@ class ArduinoListener:
                 except Exception:
                     continue
 
-                if not line:
+                if not line or line == "READY":
                     continue
 
-                # Expected: "START:chamber_A" or "STOP:chamber_A"
-                if ":" not in line:
-                    print(f"[Arduino:{self.port}] Unexpected: {line!r}")
+                # Expected: "TTL:<number>:<state>"
+                parts = line.split(":")
+                if len(parts) != 3 or parts[0] != "TTL":
+                    continue   # ignore malformed / unrelated lines silently
+
+                try:
+                    ttl_number = int(parts[1])
+                    state      = int(parts[2])
+                except ValueError:
                     continue
 
-                kind_raw, _, chamber_id = line.partition(":")
-                kind_raw   = kind_raw.strip().upper()
-                chamber_id = chamber_id.strip()
+                if state == 1:
+                    count = self._consec.get(ttl_number, 0) + 1
+                    self._consec[ttl_number] = count
 
-                if kind_raw not in ("START", "STOP"):
-                    print(f"[Arduino:{self.port}] Unknown kind {kind_raw!r} — ignored")
-                    continue
+                    already_fired = self._fired.get(ttl_number, False)
 
-                wall    = time.time()
-                sestime = time.perf_counter() - self._session_start
-                kind    = kind_raw.lower()   # "start" or "stop"
-                ts_str  = datetime.fromtimestamp(wall).strftime("%H:%M:%S.%f")
-                print(f"[Arduino:{self.port}] {kind.upper()} → {chamber_id}  at {ts_str}")
+                    if count >= self.CONFIRM_COUNT and not already_fired:
+                        wall    = time.time()
+                        sestime = time.perf_counter() - self._session_start
+                        ts_str  = datetime.fromtimestamp(wall).strftime("%H:%M:%S.%f")
+                        print(f"[AnalogTTL:{self.port}] TTL{ttl_number} confirmed "
+                             f"active ({count} consecutive reads) at {ts_str}")
 
-                self._eq.put(TTLEvent(
-                    chamber = chamber_id,
-                    kind    = kind,
-                    wall    = wall,
-                    sestime = sestime,
-                    label   = f"arduino_{kind}",
-                ))
+                        self._fired[ttl_number] = True
+                        self._eq.put(TTLEvent(
+                            chamber    = "",        # resolved by main() via ttl_number
+                            kind       = "ttl_active",
+                            wall       = wall,
+                            sestime    = sestime,
+                            label      = f"TTL{ttl_number}",
+                            ttl_number = ttl_number,
+                        ))
+                else:
+                    # Voltage dropped — reset both counters so the next
+                    # sustained high run can fire again
+                    self._consec[ttl_number] = 0
+                    self._fired[ttl_number]  = False
 
-        print(f"[Arduino:{self.port}] Read loop exited.")
+        print(f"[AnalogTTL:{self.port}] Read loop exited.")
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +332,7 @@ class CameraWriter:
             if self.metadata_cfg.get("save_timestamp",  True): hdr.append("camera_hw_ts_s")
             if self.metadata_cfg.get("save_sestime",    True): hdr.append("sestime_s")
             if self.metadata_cfg.get("save_cputime",    True): hdr.append("cpu_wall_s")
-            hdr += ["ttl_chamber", "ttl_kind", "ttl_label"]
+            hdr += ["ttl_chamber", "ttl_kind", "ttl_label", "ttl_number"]
             csvw.writerow(hdr)
             csv_file.flush()
 
@@ -298,7 +350,8 @@ class CameraWriter:
                         if cfg.get("save_timestamp",  True): row.append(f"{evt.wall:.6f}")
                         if cfg.get("save_sestime",    True): row.append(f"{evt.sestime:.6f}")
                         if cfg.get("save_cputime",    True): row.append(f"{evt.wall:.6f}")
-                        row += [evt.chamber, evt.kind, evt.label]
+                        row += [evt.chamber, evt.kind, evt.label,
+                               evt.ttl_number if evt.ttl_number is not None else ""]
                         csvw.writerow(row)
                         csv_file.flush()
                 except queue.Empty:
@@ -350,7 +403,7 @@ class CameraWriter:
                 if cfg.get("save_timestamp",  True): row.append(f"{timestamp:.6f}")
                 if cfg.get("save_sestime",    True): row.append(f"{sestime:.6f}")
                 if cfg.get("save_cputime",    True): row.append(f"{cputime:.6f}")
-                row += ["", "", ""]
+                row += ["", "", "", ""]
                 csvw.writerow(row)
 
         self.end_wall = time.time()
@@ -381,6 +434,7 @@ class CameraStreamer:
         }
         self.cam_names = list(self.cam_configs.keys())
         self.cameras: dict[str, PySpin.Camera] = {}
+        self._locked_serials: list[str] = []
 
         # Recording state — keyed by camera name
         self._recording: dict[str, bool]         = {n: False for n in self.cam_names}
@@ -437,6 +491,20 @@ class CameraStreamer:
             if cam_key in self.cam_names:
                 self.chamber_to_cam[ch_name] = cam_key
                 self.cam_to_chamber[cam_key] = ch_name
+
+        # Build ttl_number → (chamber_name, "start"|"stop") map.
+        # Each chamber's arduino block specifies start_ttl / stop_ttl —
+        # the global sequential TTL channel numbers (1-indexed) that the
+        # Arduino sketch reports for that chamber's pins.
+        self.ttl_number_map: dict[int, tuple] = {}
+        for ch_name, ch_cfg in self.chambers_cfg.items():
+            ard = ch_cfg.get("arduino", {})
+            start_ttl = ard.get("start_ttl")
+            stop_ttl  = ard.get("stop_ttl")
+            if start_ttl is not None:
+                self.ttl_number_map[int(start_ttl)] = (ch_name, "start")
+            if stop_ttl is not None:
+                self.ttl_number_map[int(stop_ttl)] = (ch_name, "stop")
 
     # ------------------------------------------------------------------
     # Recording control
@@ -509,21 +577,45 @@ class CameraStreamer:
     # ------------------------------------------------------------------
 
     def route_ttl_event(self, evt: TTLEvent):
+        """
+        Resolve a raw 'ttl_active' event (carrying only ttl_number) into a
+        concrete (chamber, start/stop) pair using ttl_number_map, then act.
+
+        Events that already carry a resolved chamber + kind (legacy path,
+        e.g. manual events) are routed directly.
+        """
+        if evt.kind == "ttl_active" and evt.ttl_number is not None:
+            resolved = self.ttl_number_map.get(evt.ttl_number)
+            if not resolved:
+                print(f"[TTL] TTL{evt.ttl_number} confirmed but not mapped "
+                     f"to any chamber's start_ttl/stop_ttl — ignored.")
+                return
+            ch_name, kind = resolved
+            evt.chamber = ch_name
+            evt.kind    = kind   # now "start" or "stop"
+
         cam_name = self.chamber_to_cam.get(evt.chamber)
         if not cam_name:
             return
 
-        # Always push event to writer queue for logging
-        self._ttl_queues[cam_name].put(evt)
+        # Always push event to writer queue for logging — even if it
+        # doesn't trigger a state change (e.g. start pulse while already
+        # recording), it still appears in the CSV as required.
+        if cam_name in self._ttl_queues:
+            self._ttl_queues[cam_name].put(evt)
 
         if evt.kind == "start":
             if not self.is_recording(cam_name):
                 self.start_recording(cam_name)
             else:
-                print(f"[TTL] {evt.chamber} start pulse — already recording, logged only.")
+                print(f"[TTL] {evt.chamber} start (TTL{evt.ttl_number}) — "
+                     f"already recording, logged only.")
         elif evt.kind == "stop":
             if self.is_recording(cam_name):
                 self.stop_recording(cam_name)
+            else:
+                print(f"[TTL] {evt.chamber} stop (TTL{evt.ttl_number}) — "
+                     f"not recording, logged only.")
 
     # ------------------------------------------------------------------
     # Session summary
@@ -717,8 +809,40 @@ class CameraStreamer:
             return False
         return True
 
+    def _claim_locks(self) -> bool:
+        """
+        Claim exclusive locks for every camera serial before Init().
+        If any camera is already held by a live preview.py or another
+        acquisition instance, refuse and report exactly which one.
+        """
+        ok = True
+        for name, cfg in self.cam_configs.items():
+            serial = cfg["serial"]
+            if acquire_camera_lock(serial, owner=f"multiAcquisition.py:{name}"):
+                self._locked_serials.append(serial)
+            else:
+                holder = who_holds_lock(serial)
+                print(f"[Acquisition] Camera '{name}' (serial {serial}) is "
+                     f"already in use by {holder}.")
+                print(f"              Close that process (e.g. preview.py) "
+                     f"before starting acquisition.")
+                ok = False
+        return ok
+
+    def _release_locks(self):
+        for serial in self._locked_serials:
+            release_camera_lock(serial)
+        self._locked_serials.clear()
+
     def _init_cameras(self):
+        if not self._claim_locks():
+            raise RuntimeError(
+                "One or more cameras are already in use by another process. "
+                "Spinnaker cameras can only be opened by one process at a time — "
+                "stop preview.py (or any other acquisition instance) first."
+            )
         if not self._find_cameras():
+            self._release_locks()
             raise RuntimeError("Not all cameras found.")
         for name, cam in self.cameras.items():
             cam.Init()
@@ -778,6 +902,7 @@ class CameraStreamer:
             except Exception:
                 pass
         self.cameras.clear()
+        self._release_locks()
 
 
 # ---------------------------------------------------------------------------
@@ -959,6 +1084,12 @@ def run_setup_wizard(system, output_path="config.yaml"):
 
     cameras_cfg  = {}
     chambers_cfg = {}
+    print("\nEach chamber uses 3 consecutive analog TTL channels from the Arduino")
+    print("sketch (chamber_ttl_analog.ino): one to START recording, one to STOP,")
+    print("and one spare. TTL channels are numbered sequentially starting at 1")
+    print("in the same order as ANALOG_PINS in the sketch (chamber 1 -> TTL 1,2,3;")
+    print("chamber 2 -> TTL 4,5,6; etc).\n")
+
     for i in selected:
         d    = devices[i]
         name = input(f"\nCam {i} ({d['serial']}) name [cam{i}]: ").strip() or f"cam{i}"
@@ -971,15 +1102,25 @@ def run_setup_wizard(system, output_path="config.yaml"):
         port = input(f"  Arduino serial port for {ch} [COM3]: ").strip() or "COM3"
         baud_raw = input(f"  Baud rate [115200]: ").strip()
         baud = int(baud_raw) if baud_raw.isdigit() else 115200
+
+        default_start = i * 3 + 1
+        default_stop  = i * 3 + 2
+        start_raw = input(f"  Start TTL number for {ch} [{default_start}]: ").strip()
+        stop_raw  = input(f"  Stop  TTL number for {ch} [{default_stop}]: ").strip()
+        start_ttl = int(start_raw) if start_raw.isdigit() else default_start
+        stop_ttl  = int(stop_raw)  if stop_raw.isdigit()  else default_stop
+
         chambers_cfg[ch] = {
             "camera": f"cam{i}",
             "record": True,
             "timer_enabled": False,
             "duration_s": 1800,
             "arduino": {
-                "port":       port,
-                "baud":       baud,
-                "chamber_id": ch,
+                "port":      port,
+                "baud":      baud,
+                "start_ttl": start_ttl,
+                "stop_ttl":  stop_ttl,
+                "vref":      5.0,
             },
         }
 
@@ -1042,15 +1183,22 @@ def main():
     config = load_config(args.config)
 
     streamer = CameraStreamer(config, system)
-    streamer._init_cameras()
+    try:
+        streamer._init_cameras()
+    except RuntimeError as e:
+        print(f"\n[Acquisition] Failed to start: {e}")
+        system.ReleaseInstance()
+        return
     streamer._start_threads()
 
-    # Build Arduino listeners — one per unique port
-    # Multiple chambers can share a port (one Arduino, multiple pins)
+    # Build analog TTL listeners — one per unique serial port.
+    # Multiple chambers can share a port (one Arduino, multiple analog pins);
+    # the ttl_number_map built in CameraStreamer.__init__ resolves which
+    # chamber + start/stop each confirmed TTL channel belongs to.
     chambers_cfg   = config.get("chambers", {})
     ttl_dispatch_q = queue.Queue()
-    listeners: list[ArduinoListener] = []
-    port_to_listener: dict[str, ArduinoListener] = {}
+    listeners: list[AnalogTTLListener] = []
+    port_to_listener: dict[str, AnalogTTLListener] = {}
 
     for ch_name, ch_cfg in chambers_cfg.items():
         cam_key = ch_cfg.get("camera")
@@ -1059,16 +1207,21 @@ def main():
             continue
 
         ard = ch_cfg.get("arduino", {})
-        port = ard.get("port", "")
-        baud = ard.get("baud", 115200)
+        port      = ard.get("port", "")
+        baud      = ard.get("baud", 115200)
+        start_ttl = ard.get("start_ttl")
+        stop_ttl  = ard.get("stop_ttl")
 
         if not port:
             print(f"[Warning] Chamber {ch_name} has no arduino.port — skipped.")
             continue
+        if start_ttl is None and stop_ttl is None:
+            print(f"[Warning] Chamber {ch_name} has no start_ttl/stop_ttl — "
+                 f"it will never trigger automatically (manual/auto-start only).")
 
-        # Reuse listener if this port already has one
+        # Reuse listener if this port already has one (shared Arduino)
         if port not in port_to_listener:
-            lst = ArduinoListener(
+            lst = AnalogTTLListener(
                 port          = port,
                 baud          = baud,
                 event_queue   = ttl_dispatch_q,
