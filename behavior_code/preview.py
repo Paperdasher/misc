@@ -51,6 +51,8 @@ import yaml
 import cv2
 import PySpin
 
+from camera_lock import acquire_camera_lock, release_camera_lock, who_holds_lock
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -92,6 +94,12 @@ class PreviewStreamer:
                         for n in self.cam_names}
         self._slocks = {n: threading.Lock() for n in self.cam_names}
 
+        # Per-camera error state — shown in the tile instead of freezing silently
+        self._errors = {n: None for n in self.cam_names}
+        self._elocks = {n: threading.Lock() for n in self.cam_names}
+
+        self._locked_serials: list[str] = []
+
         self._stop    = threading.Event()
         self._threads: list[threading.Thread] = []
 
@@ -113,6 +121,25 @@ class PreviewStreamer:
             print(f"[Preview] Cameras not found: {missing}")
             return False
         return True
+
+    def _claim_locks(self) -> bool:
+        """
+        Try to claim exclusive locks for every camera serial before Init().
+        If any camera is already held by another live process, refuse to
+        proceed and report which camera / process is conflicting.
+        """
+        ok = True
+        for name, cfg in self.cam_configs.items():
+            serial = cfg["serial"]
+            if acquire_camera_lock(serial, owner=f"preview.py:{name}"):
+                self._locked_serials.append(serial)
+            else:
+                holder = who_holds_lock(serial)
+                print(f"[Preview] Camera '{name}' (serial {serial}) is already "
+                     f"in use by {holder}.")
+                print(f"          Close that process first, or stop its acquisition/preview.")
+                ok = False
+        return ok
 
     def _configure(self, cam, name: str):
         nodemap = cam.GetNodeMap()
@@ -169,7 +196,15 @@ class PreviewStreamer:
               f"gain={cam.Gain.GetValue():.1f}dB")
 
     def init(self):
+        if not self._claim_locks():
+            raise RuntimeError(
+                "One or more cameras are already in use by another process "
+                "(another preview.py or multiAcquisition.py instance). "
+                "Close it first — Spinnaker cameras can only be opened by one "
+                "process at a time."
+            )
         if not self._find_cameras():
+            self._release_locks()
             raise RuntimeError("Not all cameras found.")
         for name, cam in self.cameras.items():
             print(f"\n[Preview] Configuring {name}...")
@@ -178,10 +213,18 @@ class PreviewStreamer:
             cam.BeginAcquisition()
             print(f"  {name}: streaming.")
 
+    def _release_locks(self):
+        for serial in self._locked_serials:
+            release_camera_lock(serial)
+        self._locked_serials.clear()
+
     # ---- capture thread ----------------------------------------------------
 
     def _capture(self, name: str, cam):
         idx = 0
+        consecutive_errors = 0
+        MAX_CONSECUTIVE_ERRORS = 5
+
         while not self._stop.is_set():
             try:
                 img = cam.GetNextImage(self.FRAME_TIMEOUT_MS)
@@ -191,6 +234,7 @@ class PreviewStreamer:
                 frame = np.array(img.GetNDArray(), copy=True)
                 img.Release()
                 idx += 1
+                consecutive_errors = 0   # reset on success
 
                 now = time.perf_counter()
                 with self._slocks[name]:
@@ -204,9 +248,37 @@ class PreviewStreamer:
                 with self._flocks[name]:
                     self._frames[name] = frame
 
+                with self._elocks[name]:
+                    self._errors[name] = None   # clear any prior error
+
             except PySpin.SpinnakerException as ex:
-                if not self._stop.is_set():
-                    print(f"[Preview] {name} capture error: {ex}")
+                if self._stop.is_set():
+                    break
+
+                consecutive_errors += 1
+                msg = str(ex)
+                with self._elocks[name]:
+                    self._errors[name] = msg
+                print(f"[Preview] {name} capture error ({consecutive_errors}/"
+                     f"{MAX_CONSECUTIVE_ERRORS}): {msg}")
+
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    print(f"[Preview] {name}: too many consecutive errors — "
+                         f"stopping this camera's capture thread. This usually "
+                         f"means another process opened the same camera. "
+                         f"The tile will show a clear error instead of freezing.")
+                    with self._elocks[name]:
+                        self._errors[name] = (
+                            "Camera disconnected or claimed by another "
+                            "process. Restart preview after closing it."
+                        )
+                    break   # stop hammering a broken handle — don't spin forever
+
+                time.sleep(0.2)   # brief backoff before retrying
+
+    def get_error(self, name: str):
+        with self._elocks[name]:
+            return self._errors[name]
 
     def start(self):
         for name, cam in self.cameras.items():
@@ -233,6 +305,38 @@ class PreviewStreamer:
             except Exception:
                 pass
         self.cameras.clear()
+        self._release_locks()
+
+
+def draw_error_tile(label: str, error_msg: str, w: int = 640, h: int = 480) -> np.ndarray:
+    """Visible red error tile shown when a camera's capture thread has failed,
+    instead of silently freezing on the last good frame."""
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    img[:] = (15, 15, 40)   # dark red-ish background
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(img, label, (20, 40), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(img, "CAMERA ERROR", (20, 75), font, 0.6, (80, 80, 255), 2, cv2.LINE_AA)
+
+    # Word-wrap the error message into the tile width
+    words = error_msg.split()
+    lines, cur = [], ""
+    for word in words:
+        trial = (cur + " " + word).strip()
+        if cv2.getTextSize(trial, font, 0.45, 1)[0][0] > w - 40:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = trial
+    if cur:
+        lines.append(cur)
+
+    y = 105
+    for line in lines[:6]:
+        cv2.putText(img, line, (20, y), font, 0.45, (160, 160, 220), 1, cv2.LINE_AA)
+        y += 22
+
+    return img
 
 
 # ---------------------------------------------------------------------------
@@ -450,25 +554,26 @@ def main():
             # --- Collect BGR tiles, one per camera ---
             tiles = []
             for name in streamer.cam_names:
+                error = streamer.get_error(name)
                 frame = streamer.get_frame(name)
-                if frame is None:
-                    # Placeholder while camera warms up
+
+                if error:
+                    tiles.append(draw_error_tile(name, error))
+                elif frame is None:
                     tiles.append(np.zeros((480, 640, 3), dtype=np.uint8))
-                    continue
-
-                # Convert to BGR
-                if frame.ndim == 2:
-                    bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
                 else:
-                    bgr = frame.copy()
+                    if frame.ndim == 2:
+                        bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                    else:
+                        bgr = frame.copy()
 
-                cam_cfg = config["cameras"][name]
-                label   = cam_cfg.get("name", name)
-                chamber = cam_to_chamber.get(name, cam_cfg.get("chamber", ""))
-                stats   = streamer.get_stats(name)
-                bgr     = draw_tile_overlay(bgr, label, chamber,
-                                            stats["fps"], stats["total"])
-                tiles.append(bgr)
+                    cam_cfg = config["cameras"][name]
+                    label   = cam_cfg.get("name", name)
+                    chamber = cam_to_chamber.get(name, cam_cfg.get("chamber", ""))
+                    stats   = streamer.get_stats(name)
+                    bgr     = draw_tile_overlay(bgr, label, chamber,
+                                                stats["fps"], stats["total"])
+                    tiles.append(bgr)
 
             # --- Get current window size so tiling respects user resizes ---
             try:
