@@ -52,6 +52,7 @@ import cv2
 import PySpin
 
 from camera_lock import acquire_camera_lock, release_camera_lock, who_holds_lock
+from tiling import draw_error_tile, draw_tile_overlay, tile_frames
 
 
 # ---------------------------------------------------------------------------
@@ -306,141 +307,6 @@ class PreviewStreamer:
                 pass
         self.cameras.clear()
         self._release_locks()
-
-
-def draw_error_tile(label: str, error_msg: str, w: int = 640, h: int = 480) -> np.ndarray:
-    """Visible red error tile shown when a camera's capture thread has failed,
-    instead of silently freezing on the last good frame."""
-    img = np.zeros((h, w, 3), dtype=np.uint8)
-    img[:] = (15, 15, 40)   # dark red-ish background
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    cv2.putText(img, label, (20, 40), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(img, "CAMERA ERROR", (20, 75), font, 0.6, (80, 80, 255), 2, cv2.LINE_AA)
-
-    # Word-wrap the error message into the tile width
-    words = error_msg.split()
-    lines, cur = [], ""
-    for word in words:
-        trial = (cur + " " + word).strip()
-        if cv2.getTextSize(trial, font, 0.45, 1)[0][0] > w - 40:
-            lines.append(cur)
-            cur = word
-        else:
-            cur = trial
-    if cur:
-        lines.append(cur)
-
-    y = 105
-    for line in lines[:6]:
-        cv2.putText(img, line, (20, y), font, 0.45, (160, 160, 220), 1, cv2.LINE_AA)
-        y += 22
-
-    return img
-
-
-# ---------------------------------------------------------------------------
-# Per-tile overlay
-# ---------------------------------------------------------------------------
-
-def draw_tile_overlay(frame: np.ndarray, label: str, chamber: str,
-                      fps: float, total: int) -> np.ndarray:
-    """Burn a compact HUD into one camera tile (already BGR)."""
-    display = frame.copy()
-
-    lines = [
-        label,
-        f"{chamber}",
-        f"FPS {fps:5.1f}",
-        "PREVIEW",
-    ]
-
-    font  = cv2.FONT_HERSHEY_SIMPLEX
-    sc    = 0.45
-    th    = 1
-    lh    = 17
-    pad   = 5
-
-    max_w = max(cv2.getTextSize(l, font, sc, th)[0][0] for l in lines)
-    box_h = lh * len(lines) + pad
-    box_w = max_w + pad * 2
-
-    ov = display.copy()
-    cv2.rectangle(ov, (0, 0), (box_w, box_h), (0, 0, 0), -1)
-    cv2.addWeighted(ov, 0.55, display, 0.45, 0, display)
-
-    colors = [(255, 255, 255), (0, 220, 220), (0, 220, 220), (70, 70, 180)]
-    for i, line in enumerate(lines):
-        y = pad + (i + 1) * lh - 2
-        cv2.putText(display, line, (pad, y), font, sc, colors[i], th, cv2.LINE_AA)
-
-    return display
-
-
-# ---------------------------------------------------------------------------
-# Tiled compositor
-# ---------------------------------------------------------------------------
-
-def tile_frames(frames: list[np.ndarray], win_w: int, win_h: int) -> np.ndarray:
-    """
-    Arrange up to 4 BGR frames into a single canvas of size win_w × win_h.
-
-    Layout:
-        1 cam  → full canvas
-        2 cams → left | right
-        3 cams → left | right-top
-                       | right-bottom
-        4 cams → TL | TR
-                 BL | BR
-    """
-    n = len(frames)
-    canvas = np.zeros((win_h, win_w, 3), dtype=np.uint8)
-
-    def _fit(img: np.ndarray, tw: int, th: int) -> np.ndarray:
-        """Scale img to fit inside tw×th, preserving aspect ratio, centered."""
-        h, w = img.shape[:2]
-        scale = min(tw / w, th / h)
-        nw, nh = int(w * scale), int(h * scale)
-        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
-        out = np.zeros((th, tw, 3), dtype=np.uint8)
-        y0 = (th - nh) // 2
-        x0 = (tw - nw) // 2
-        out[y0:y0 + nh, x0:x0 + nw] = resized
-        return out
-
-    def _place(img: np.ndarray, x: int, y: int, w: int, h: int):
-        tile = _fit(img, w, h)
-        canvas[y:y + h, x:x + w] = tile
-
-    if n == 1:
-        _place(frames[0], 0, 0, win_w, win_h)
-
-    elif n == 2:
-        hw = win_w // 2
-        _place(frames[0], 0,  0, hw, win_h)
-        _place(frames[1], hw, 0, win_w - hw, win_h)
-        cv2.line(canvas, (hw, 0), (hw, win_h), (40, 40, 40), 1)
-
-    elif n == 3:
-        hw  = win_w // 2
-        hh  = win_h // 2
-        _place(frames[0], 0,  0,   hw,          win_h)
-        _place(frames[1], hw, 0,   win_w - hw,  hh)
-        _place(frames[2], hw, hh,  win_w - hw,  win_h - hh)
-        cv2.line(canvas, (hw, 0),  (hw, win_h),   (40, 40, 40), 1)
-        cv2.line(canvas, (hw, hh), (win_w, hh),   (40, 40, 40), 1)
-
-    else:   # 4
-        hw = win_w // 2
-        hh = win_h // 2
-        _place(frames[0], 0,  0,  hw,         hh)
-        _place(frames[1], hw, 0,  win_w - hw, hh)
-        _place(frames[2], 0,  hh, hw,         win_h - hh)
-        _place(frames[3], hw, hh, win_w - hw, win_h - hh)
-        cv2.line(canvas, (hw, 0),  (hw, win_h),  (40, 40, 40), 1)
-        cv2.line(canvas, (0, hh),  (win_w, hh),  (40, 40, 40), 1)
-
-    return canvas
 
 
 # ---------------------------------------------------------------------------

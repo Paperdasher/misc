@@ -89,6 +89,7 @@ import cv2
 import PySpin
 
 from camera_lock import acquire_camera_lock, release_camera_lock, who_holds_lock
+from tiling import draw_error_tile, draw_tile_overlay, tile_frames
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +455,13 @@ class CameraStreamer:
         }
         self._rec_start_times: dict[str, float] = {}
 
+        # Live preview frames — populated by the capture thread regardless
+        # of recording state, so a tile window can show them even when idle.
+        # This does NOT open a second camera handle; it's the same frames
+        # already being captured for recording, just also cached for display.
+        self._preview_frames = {n: None             for n in self.cam_names}
+        self._preview_locks  = {n: threading.Lock() for n in self.cam_names}
+
         self._capture_threads: list[threading.Thread] = []
 
         rec = config["recording"]
@@ -482,7 +490,7 @@ class CameraStreamer:
         with open(os.path.join(self.session_dir, "config.yaml"), "w") as f:
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
-        # Build chamber → camera map and chamber output dirs
+        # Build chamber → camera map
         self.chambers_cfg = config.get("chambers", {})
         self.chamber_to_cam: dict[str, str] = {}
         self.cam_to_chamber: dict[str, str] = {}
@@ -492,19 +500,30 @@ class CameraStreamer:
                 self.chamber_to_cam[ch_name] = cam_key
                 self.cam_to_chamber[cam_key] = ch_name
 
-        # Build ttl_number → (chamber_name, "start"|"stop") map.
-        # Each chamber's arduino block specifies start_ttl / stop_ttl —
-        # the global sequential TTL channel numbers (1-indexed) that the
-        # Arduino sketch reports for that chamber's pins.
-        self.ttl_number_map: dict[int, tuple] = {}
-        for ch_name, ch_cfg in self.chambers_cfg.items():
-            ard = ch_cfg.get("arduino", {})
-            start_ttl = ard.get("start_ttl")
-            stop_ttl  = ard.get("stop_ttl")
-            if start_ttl is not None:
-                self.ttl_number_map[int(start_ttl)] = (ch_name, "start")
-            if stop_ttl is not None:
-                self.ttl_number_map[int(stop_ttl)] = (ch_name, "stop")
+        # Build TTL action map from global ttl_map list.
+        # ttl_map is a list of dicts, each entry defining one pin's role:
+        #   { pin: "A0", ttl_label: "session_start", chamber: "chamber_A",
+        #     action: "start_recording" }
+        # Pin entries appear in the same order as ANALOG_PINS in the Arduino
+        # sketch, so TTL channel number = list index + 1.
+        # Valid actions: "start_recording", "stop_recording", "log_event"
+        #
+        # self.ttl_action_map: ttl_number (int) → {chamber, action, label, pin}
+        self.ttl_action_map: dict[int, dict] = {}
+        for idx, entry in enumerate(config.get("ttl_map", [])):
+            ttl_num = idx + 1
+            self.ttl_action_map[ttl_num] = {
+                "chamber": entry.get("chamber", ""),
+                "action":  entry.get("action",  "log_event"),
+                "label":   entry.get("ttl_label", f"TTL{ttl_num}"),
+                "pin":     entry.get("pin", f"A{idx}"),
+            }
+
+        if not self.ttl_action_map:
+            print("[TTL] No ttl_map entries found in config — "
+                 "TTL triggering will not be active. "
+                 "Add entries under 'ttl_map:' in config.yaml or via the "
+                 "TTL Map tab in config.py.")
 
     # ------------------------------------------------------------------
     # Recording control
@@ -578,44 +597,71 @@ class CameraStreamer:
 
     def route_ttl_event(self, evt: TTLEvent):
         """
-        Resolve a raw 'ttl_active' event (carrying only ttl_number) into a
-        concrete (chamber, start/stop) pair using ttl_number_map, then act.
+        Resolve a confirmed 'ttl_active' event (carrying ttl_number) into
+        a concrete chamber + action using ttl_action_map, then act.
 
-        Events that already carry a resolved chamber + kind (legacy path,
-        e.g. manual events) are routed directly.
+        Actions:
+            start_recording  → starts that chamber's camera if not already recording
+            stop_recording   → stops it if currently recording
+            log_event        → logs to that chamber's CSV only, no recording change
         """
-        if evt.kind == "ttl_active" and evt.ttl_number is not None:
-            resolved = self.ttl_number_map.get(evt.ttl_number)
-            if not resolved:
-                print(f"[TTL] TTL{evt.ttl_number} confirmed but not mapped "
-                     f"to any chamber's start_ttl/stop_ttl — ignored.")
-                return
-            ch_name, kind = resolved
-            evt.chamber = ch_name
-            evt.kind    = kind   # now "start" or "stop"
-
-        cam_name = self.chamber_to_cam.get(evt.chamber)
-        if not cam_name:
+        if evt.kind != "ttl_active" or evt.ttl_number is None:
             return
 
-        # Always push event to writer queue for logging — even if it
-        # doesn't trigger a state change (e.g. start pulse while already
-        # recording), it still appears in the CSV as required.
-        if cam_name in self._ttl_queues:
-            self._ttl_queues[cam_name].put(evt)
+        mapping = self.ttl_action_map.get(evt.ttl_number)
+        if not mapping:
+            print(f"[TTL] TTL{evt.ttl_number} confirmed but not in ttl_map — ignored. "
+                 f"Add an entry for pin index {evt.ttl_number - 1} in config.yaml.")
+            return
 
-        if evt.kind == "start":
+        ch_name = mapping["chamber"]
+        action  = mapping["action"]
+        label   = mapping["label"]
+        pin     = mapping["pin"]
+
+        # Resolve the event fields from the map
+        evt.chamber = ch_name
+        evt.kind    = action    # store action as kind for CSV row
+        evt.label   = label
+
+        cam_name = self.chamber_to_cam.get(ch_name)
+        if not cam_name:
+            print(f"[TTL] ttl_map entry for TTL{evt.ttl_number} references "
+                 f"chamber '{ch_name}' which has no mapped camera — ignored.")
+            return
+
+        # Log to CSV for this chamber regardless of action type.
+        # Writer only queues events while recording is active; if not recording
+        # and action is log_event, the event is printed but not persisted.
+        if self._recording.get(cam_name):
+            self._ttl_queues[cam_name].put(evt)
+        else:
+            print(f"[TTL] {label} (TTL{evt.ttl_number}, pin {pin}) → "
+                 f"{ch_name} — not recording, event not written to CSV.")
+
+        ts = datetime.fromtimestamp(evt.wall).strftime("%H:%M:%S.%f")
+
+        if action == "start_recording":
             if not self.is_recording(cam_name):
+                print(f"[TTL] {label} → START {ch_name} at {ts}")
                 self.start_recording(cam_name)
+                # Re-queue now that writer exists
+                self._ttl_queues[cam_name].put(evt)
             else:
-                print(f"[TTL] {evt.chamber} start (TTL{evt.ttl_number}) — "
-                     f"already recording, logged only.")
-        elif evt.kind == "stop":
+                print(f"[TTL] {label} → {ch_name} already recording, logged only.")
+
+        elif action == "stop_recording":
             if self.is_recording(cam_name):
+                print(f"[TTL] {label} → STOP {ch_name} at {ts}")
                 self.stop_recording(cam_name)
             else:
-                print(f"[TTL] {evt.chamber} stop (TTL{evt.ttl_number}) — "
-                     f"not recording, logged only.")
+                print(f"[TTL] {label} → {ch_name} not recording, nothing to stop.")
+
+        elif action == "log_event":
+            print(f"[TTL] {label} (TTL{evt.ttl_number}, pin {pin}) → "
+                 f"logged to {ch_name} at {ts}")
+        else:
+            print(f"[TTL] Unknown action '{action}' for TTL{evt.ttl_number} — ignored.")
 
     # ------------------------------------------------------------------
     # Session summary
@@ -855,6 +901,7 @@ class CameraStreamer:
     # ------------------------------------------------------------------
 
     def _capture_frame(self, cam_name: str, cam):
+        downsample = self.config.get("preview", {}).get("downsample", 1)
         idx = 0
         while not self._stop_event.is_set():
             try:
@@ -872,6 +919,11 @@ class CameraStreamer:
                 idx += 1
                 self._update_stats(cam_name, idx)
 
+                # Cache for live preview tile — independent of recording state
+                if (idx - 1) % downsample == 0:
+                    with self._preview_locks[cam_name]:
+                        self._preview_frames[cam_name] = frame
+
                 if self._recording.get(cam_name):
                     w = self._writers.get(cam_name)
                     if w:
@@ -880,6 +932,11 @@ class CameraStreamer:
             except PySpin.SpinnakerException as ex:
                 if not self._stop_event.is_set():
                     print(f"[Capture:{cam_name}] {ex}")
+
+    def get_preview_frame(self, cam_name: str):
+        """Latest cached frame for live preview tile — None if not yet captured."""
+        with self._preview_locks[cam_name]:
+            return self._preview_frames[cam_name]
 
     def _start_threads(self):
         for name, cam in self.cameras.items():
@@ -1084,11 +1141,15 @@ def run_setup_wizard(system, output_path="config.yaml"):
 
     cameras_cfg  = {}
     chambers_cfg = {}
-    print("\nEach chamber uses 3 consecutive analog TTL channels from the Arduino")
-    print("sketch (chamber_ttl_analog.ino): one to START recording, one to STOP,")
-    print("and one spare. TTL channels are numbered sequentially starting at 1")
-    print("in the same order as ANALOG_PINS in the sketch (chamber 1 -> TTL 1,2,3;")
-    print("chamber 2 -> TTL 4,5,6; etc).\n")
+    ttl_map_entries = []
+
+    print("\nEach chamber's analog pins map to TTL channel numbers sequentially")
+    print("(first pin in ANALOG_PINS = TTL 1, second = TTL 2, etc).")
+    print("The TTL Map defines which channel starts/stops each chamber.\n")
+
+    port = input("Arduino serial port [COM3]: ").strip() or "COM3"
+    baud_raw = input("Baud rate [115200]: ").strip()
+    baud = int(baud_raw) if baud_raw.isdigit() else 115200
 
     for i in selected:
         d    = devices[i]
@@ -1099,41 +1160,57 @@ def run_setup_wizard(system, output_path="config.yaml"):
             "enabled": True, "exposure_us": 14000, "gain_db": 10,
             "black_level": 2.0, "throughput_limit": 90_000_000,
         }
-        port = input(f"  Arduino serial port for {ch} [COM3]: ").strip() or "COM3"
-        baud_raw = input(f"  Baud rate [115200]: ").strip()
-        baud = int(baud_raw) if baud_raw.isdigit() else 115200
-
-        default_start = i * 3 + 1
-        default_stop  = i * 3 + 2
-        start_raw = input(f"  Start TTL number for {ch} [{default_start}]: ").strip()
-        stop_raw  = input(f"  Stop  TTL number for {ch} [{default_stop}]: ").strip()
-        start_ttl = int(start_raw) if start_raw.isdigit() else default_start
-        stop_ttl  = int(stop_raw)  if stop_raw.isdigit()  else default_stop
-
         chambers_cfg[ch] = {
             "camera": f"cam{i}",
             "record": True,
             "timer_enabled": False,
             "duration_s": 1800,
-            "arduino": {
-                "port":      port,
-                "baud":      baud,
-                "start_ttl": start_ttl,
-                "stop_ttl":  stop_ttl,
-                "vref":      5.0,
-            },
         }
+
+        # Default: 3 pins per chamber, start on first, stop on second
+        pin_base  = i * 3
+        start_pin = f"A{pin_base}"
+        stop_pin  = f"A{pin_base + 1}"
+        spare_pin = f"A{pin_base + 2}"
+
+        print(f"  Default pins for {ch}: {start_pin}=start, {stop_pin}=stop, {spare_pin}=spare")
+        print(f"  TTL numbers will be {pin_base+1} (start), {pin_base+2} (stop), {pin_base+3} (spare)")
+
+        # start entry
+        ttl_map_entries.append({
+            "pin":       start_pin,
+            "ttl_label": f"{ch}_start",
+            "chamber":   ch,
+            "action":    "start_recording",
+            "arduino":   {"port": port, "baud": baud},
+        })
+        # stop entry
+        ttl_map_entries.append({
+            "pin":       stop_pin,
+            "ttl_label": f"{ch}_stop",
+            "chamber":   ch,
+            "action":    "stop_recording",
+            "arduino":   {"port": port, "baud": baud},
+        })
+        # spare / log entry
+        ttl_map_entries.append({
+            "pin":       spare_pin,
+            "ttl_label": f"{ch}_event",
+            "chamber":   ch,
+            "action":    "log_event",
+            "arduino":   {"port": port, "baud": baud},
+        })
 
     save_dir = input("\nSave directory [./recordings]: ").strip() or "./recordings"
     config = {
         "save_dir": save_dir,
         "cameras":  cameras_cfg,
         "chambers": chambers_cfg,
-        "acquisition": {
-            "auto_start":    False,
-            "timer_enabled": False,
-            "duration_s":    1800,
-        },
+        # Global Arduino defaults (can be overridden per ttl_map entry)
+        "arduino": {"port": port, "baud": baud, "vref": 5.0},
+        # TTL mapping table — edit this to change which pins do what
+        "ttl_map": ttl_map_entries,
+        "acquisition": {"auto_start": False},
         "recording": {"fps": 59.99, "jpeg_quality": 90, "split_size_mb": None},
         "roi": {"width": 1020, "height": 1020, "offset_x": 0, "offset_y": 0},
         "trigger": {"enabled": False, "timeout_ms": 5000},
@@ -1191,35 +1268,30 @@ def main():
         return
     streamer._start_threads()
 
-    # Build analog TTL listeners — one per unique serial port.
-    # Multiple chambers can share a port (one Arduino, multiple analog pins);
-    # the ttl_number_map built in CameraStreamer.__init__ resolves which
-    # chamber + start/stop each confirmed TTL channel belongs to.
-    chambers_cfg   = config.get("chambers", {})
+    # Build analog TTL listeners — one per unique Arduino serial port.
+    # Ports are collected from the global ttl_map, not from chambers,
+    # since ttl_map is now the single source of truth for what each
+    # analog pin does. A top-level arduino block in config provides defaults.
+    ttl_map        = config.get("ttl_map", [])
     ttl_dispatch_q = queue.Queue()
     listeners: list[AnalogTTLListener] = []
     port_to_listener: dict[str, AnalogTTLListener] = {}
 
-    for ch_name, ch_cfg in chambers_cfg.items():
-        cam_key = ch_cfg.get("camera")
-        if not cam_key or cam_key not in streamer.cam_names:
-            print(f"[Warning] Chamber {ch_name} → unknown camera {cam_key!r}, skipped.")
-            continue
+    global_ard   = config.get("arduino", {})
+    default_port = global_ard.get("port", "")
+    default_baud = global_ard.get("baud", 115200)
 
-        ard = ch_cfg.get("arduino", {})
-        port      = ard.get("port", "")
-        baud      = ard.get("baud", 115200)
-        start_ttl = ard.get("start_ttl")
-        stop_ttl  = ard.get("stop_ttl")
+    for entry in ttl_map:
+        ard  = entry.get("arduino", {})
+        port = ard.get("port", default_port)
+        baud = ard.get("baud", default_baud)
 
         if not port:
-            print(f"[Warning] Chamber {ch_name} has no arduino.port — skipped.")
+            print(f"[Warning] ttl_map entry for pin {entry.get('pin','?')} "
+                 f"has no port — set arduino.port in the entry or a top-level "
+                 f"arduino: block in config.yaml.")
             continue
-        if start_ttl is None and stop_ttl is None:
-            print(f"[Warning] Chamber {ch_name} has no start_ttl/stop_ttl — "
-                 f"it will never trigger automatically (manual/auto-start only).")
 
-        # Reuse listener if this port already has one (shared Arduino)
         if port not in port_to_listener:
             lst = AnalogTTLListener(
                 port          = port,
@@ -1230,8 +1302,10 @@ def main():
             lst.start()
             listeners.append(lst)
             port_to_listener[port] = lst
-        # else: same Arduino already listening; its messages for this
-        # chamber_id will arrive via the shared ttl_dispatch_q
+
+    if not listeners:
+        print("[Warning] No Arduino listeners started — TTL triggering inactive. "
+             "Check that ttl_map entries have an arduino.port set.")
 
     # Acquisition settings
     acq_cfg    = config.get("acquisition", {})
@@ -1255,10 +1329,54 @@ def main():
         "chamber_to_cam": streamer.chamber_to_cam,
     })
 
+    # Optional live preview tile window — same camera frames already being
+    # captured for recording, just also displayed. No second camera handle
+    # is opened, so this never conflicts with the lock or with preview.py
+    # (which should NOT be run at the same time as this script — see below).
+    preview_enabled = config.get("preview", {}).get("enabled", True)
+    PREVIEW_WIN = "Acquisition Preview"
+    default_w, default_h = 1280, 720
+
+    if preview_enabled:
+        cv2.namedWindow(PREVIEW_WIN, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(PREVIEW_WIN, default_w, default_h)
+        print("Live preview window open (same frames being recorded — "
+             "do not also run preview.py while this script is running, "
+             "since both would try to open the same cameras).\n")
+
     try:
         while True:
             popup = build_stats_popup(streamer, streamer.chamber_to_cam)
             cv2.imshow(POPUP_WIN, popup)
+
+            if preview_enabled:
+                tiles = []
+                for name in streamer.cam_names:
+                    frame = streamer.get_preview_frame(name)
+                    if frame is None:
+                        tiles.append(np.zeros((480, 640, 3), dtype=np.uint8))
+                    else:
+                        bgr = (cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                              if frame.ndim == 2 else frame.copy())
+                        cam_cfg = config["cameras"][name]
+                        label   = cam_cfg.get("name", name)
+                        chamber = streamer.cam_to_chamber.get(name, "")
+                        stats   = streamer.get_stats(name)
+                        bgr     = draw_tile_overlay(
+                            bgr, label, chamber, stats["fps"], stats["total"],
+                            recording=streamer.is_recording(name),
+                        )
+                        tiles.append(bgr)
+
+                try:
+                    _, _, pw, ph = cv2.getWindowImageRect(PREVIEW_WIN)
+                    if pw < 64 or ph < 64:
+                        pw, ph = default_w, default_h
+                except Exception:
+                    pw, ph = default_w, default_h
+
+                composite = tile_frames(tiles[:4], pw, ph)
+                cv2.imshow(PREVIEW_WIN, composite)
 
             key = cv2.waitKey(100) & 0xFF
 

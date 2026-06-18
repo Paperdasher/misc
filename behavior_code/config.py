@@ -278,35 +278,24 @@ class CamerasTab(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Arduino analog connection widget  (one per chamber)
+# Arduino port widget  (one per chamber — port/baud/vref only)
 # ---------------------------------------------------------------------------
-class ArduinoSigWidget(QGroupBox):
+class ArduinoPortWidget(QGroupBox):
     """
-    Configures the Arduino analog TTL connection for one chamber.
+    Per-chamber Arduino connection settings: which port, baud rate, and
+    board voltage. These are referenced in the TTL Map tab when entries
+    for this chamber don't override them individually.
 
-    Each chamber uses 3 consecutive analog channels on the Arduino sketch
-    (chamber_ttl_analog.ino), numbered sequentially across all chambers
-    starting at 1 (chamber 1 -> TTL 1,2,3; chamber 2 -> TTL 4,5,6; etc).
-    Within a chamber: one TTL number STARTS recording, one STOPS it, and
-    the third (if used) is a spare/unused channel.
-
-    The script requires 3 consecutive confirmed-high readings of a TTL
-    number before acting — this is fixed in multiAcquisition.py and not
-    configurable here, since it's a noise-filtering safeguard rather than
-    a per-chamber setting.
-
-    Multiple chambers can share one Arduino (same port, different TTL
-    numbers) — just give them the same port and different TTL ranges.
+    TTL channel mapping (which pin does what action) is configured
+    globally in the TTL Map tab, not here.
     """
     BAUDS = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
 
-    def __init__(self, title: str, cfg: dict, chamber_key: str, parent=None):
-        super().__init__(title, parent)
-        self._chamber_key = chamber_key
+    def __init__(self, cfg: dict, parent=None):
+        super().__init__("Arduino Connection", parent)
         g = QGridLayout(self); g.setSpacing(8)
         g.setColumnStretch(1, 1); g.setColumnStretch(3, 1)
 
-        # Port
         self.port = QLineEdit(cfg.get("port", "COM3"))
         self.port.setPlaceholderText("e.g. COM3 or /dev/ttyUSB0")
         self.scan_btn = QPushButton("Scan ports")
@@ -317,13 +306,11 @@ class ArduinoSigWidget(QGroupBox):
         port_row = QWidget(); pr = QHBoxLayout(port_row); pr.setContentsMargins(0,0,0,0)
         pr.addWidget(self.port, 1); pr.addWidget(self.scan_btn)
 
-        # Baud
         self.baud = QComboBox()
         for b in self.BAUDS: self.baud.addItem(str(b), b)
         bi = self.baud.findText(str(cfg.get("baud", 115200)))
         if bi >= 0: self.baud.setCurrentIndex(bi)
 
-        # Board voltage toggle — 5V vs 3.3V, affects threshold in the sketch
         self.vref = QComboBox()
         self.vref.addItem("5.0 V  (Uno / Mega / Nano)", 5.0)
         self.vref.addItem("3.3 V  (Due / Zero / MKR)",  3.3)
@@ -332,26 +319,15 @@ class ArduinoSigWidget(QGroupBox):
             if abs(self.vref.itemData(i) - vref_val) < 0.01:
                 self.vref.setCurrentIndex(i); break
 
-        # Start / Stop TTL channel numbers
-        self.start_ttl = QSpinBox(); self.start_ttl.setRange(1, 999)
-        self.start_ttl.setValue(cfg.get("start_ttl", 1))
-        self.stop_ttl  = QSpinBox(); self.stop_ttl.setRange(1, 999)
-        self.stop_ttl.setValue(cfg.get("stop_ttl", 2))
-
-        g.addWidget(lbl("Port"),            0, 0); g.addWidget(port_row,       0, 1, 1, 3)
-        g.addWidget(self._scan_lbl,         1, 0, 1, 4)
-        g.addWidget(lbl("Baud rate"),       2, 0); g.addWidget(self.baud,      2, 1)
-        g.addWidget(lbl("Board voltage"),   2, 2); g.addWidget(self.vref,      2, 3)
-        g.addWidget(lbl("Start TTL #"),     3, 0); g.addWidget(self.start_ttl, 3, 1)
-        g.addWidget(lbl("Stop TTL #"),      3, 2); g.addWidget(self.stop_ttl,  3, 3)
+        g.addWidget(lbl("Port"),          0, 0); g.addWidget(port_row,  0, 1, 1, 3)
+        g.addWidget(self._scan_lbl,       1, 0, 1, 4)
+        g.addWidget(lbl("Baud rate"),     2, 0); g.addWidget(self.baud, 2, 1)
+        g.addWidget(lbl("Board voltage"), 2, 2); g.addWidget(self.vref, 2, 3)
         g.addWidget(note(
-            "TTL numbers are sequential across ALL chambers, matching pin order in "
-            "ANALOG_PINS in chamber_ttl_analog.ino (chamber 1 = TTL 1,2,3; chamber 2 = "
-            "TTL 4,5,6; etc). 3 consecutive confirmed-high reads of the Start TTL begins "
-            "recording; 3 consecutive reads of the Stop TTL ends it.\n"
-            "Board voltage must match BOARD_VREF set in the sketch — this only affects "
-            "documentation here; update the sketch constant yourself to match."
-        ), 4, 0, 1, 4)
+            "Board voltage is informational — it must also match BOARD_VREF "
+            "set inside chamber_ttl_analog.ino. "
+            "Which pins trigger which actions is configured in the TTL Map tab."
+        ), 3, 0, 1, 4)
 
     def _scan(self):
         try:
@@ -359,7 +335,8 @@ class ArduinoSigWidget(QGroupBox):
             ports = list(lp.comports())
             if ports:
                 self._scan_lbl.setText(
-                    "  " + "   ".join(f"{p.device} ({p.description[:30]})" for p in sorted(ports))
+                    "  " + "   ".join(f"{p.device} ({p.description[:28]})"
+                                     for p in sorted(ports))
                 )
                 if self.port.text() in ("COM3", "COM1", ""):
                     self.port.setText(sorted(ports)[0].device)
@@ -376,17 +353,245 @@ class ArduinoSigWidget(QGroupBox):
         for i in range(self.vref.count()):
             if abs(self.vref.itemData(i) - vref_val) < 0.01:
                 self.vref.setCurrentIndex(i); break
-        self.start_ttl.setValue(cfg.get("start_ttl", 1))
-        self.stop_ttl.setValue(cfg.get("stop_ttl", 2))
 
     def dump(self) -> dict:
         return {
-            "port":      self.port.text().strip(),
-            "baud":      int(self.baud.currentText()),
-            "vref":      self.vref.currentData(),
-            "start_ttl": self.start_ttl.value(),
-            "stop_ttl":  self.stop_ttl.value(),
+            "port": self.port.text().strip(),
+            "baud": int(self.baud.currentText()),
+            "vref": self.vref.currentData(),
         }
+
+
+# ---------------------------------------------------------------------------
+# Tab: TTL Map  — global analog-pin → chamber → action table
+# ---------------------------------------------------------------------------
+
+class TTLMapRow(QWidget):
+    """One row in the TTL map table."""
+
+    ACTIONS  = ["start_recording", "stop_recording", "log_event"]
+    PIN_OPTS = [f"A{i}" for i in range(16)] + [f"D{i}" for i in range(54)]
+
+    def __init__(self, cfg: dict, chamber_keys: list[str], row_num: int):
+        super().__init__()
+        self._row_num = row_num
+        lay = QHBoxLayout(self); lay.setContentsMargins(0, 2, 0, 2); lay.setSpacing(6)
+
+        # TTL # (read-only, derived from row position)
+        ttl_lbl = QLabel(f"TTL {row_num}")
+        ttl_lbl.setFixedWidth(46)
+        ttl_lbl.setStyleSheet(f"color:#e8a020; font-weight:bold; font-size:11px;")
+
+        # Pin
+        self.pin = QComboBox(); self.pin.setFixedWidth(68)
+        for p in self.PIN_OPTS: self.pin.addItem(p)
+        pin_idx = self.pin.findText(cfg.get("pin", f"A{row_num - 1}"))
+        if pin_idx >= 0: self.pin.setCurrentIndex(pin_idx)
+
+        # TTL label
+        self.ttl_label = QLineEdit(cfg.get("ttl_label", f"ttl{row_num}"))
+        self.ttl_label.setPlaceholderText("label")
+        self.ttl_label.setFixedWidth(130)
+
+        # Chamber
+        self.chamber = QComboBox(); self.chamber.setFixedWidth(120)
+        self.chamber.addItem("")   # blank = unassigned
+        for ck in chamber_keys: self.chamber.addItem(ck)
+        ci = self.chamber.findText(cfg.get("chamber", ""))
+        if ci >= 0: self.chamber.setCurrentIndex(ci)
+
+        # Action
+        self.action = QComboBox(); self.action.setFixedWidth(148)
+        for a in self.ACTIONS: self.action.addItem(a)
+        ai = self.action.findText(cfg.get("action", "log_event"))
+        if ai >= 0: self.action.setCurrentIndex(ai)
+
+        # Per-row Arduino port override (optional — blank uses global)
+        self.port_override = QLineEdit(
+            cfg.get("arduino", {}).get("port", ""))
+        self.port_override.setPlaceholderText("port override (blank = global)")
+        self.port_override.setFixedWidth(140)
+
+        lay.addWidget(ttl_lbl)
+        lay.addWidget(lbl("pin"))
+        lay.addWidget(self.pin)
+        lay.addWidget(lbl("label"))
+        lay.addWidget(self.ttl_label)
+        lay.addWidget(lbl("chamber"))
+        lay.addWidget(self.chamber)
+        lay.addWidget(lbl("action"))
+        lay.addWidget(self.action)
+        lay.addWidget(lbl("port"))
+        lay.addWidget(self.port_override)
+        lay.addStretch()
+
+    def update_chambers(self, chamber_keys: list[str]):
+        current = self.chamber.currentText()
+        self.chamber.clear()
+        self.chamber.addItem("")
+        for ck in chamber_keys: self.chamber.addItem(ck)
+        ci = self.chamber.findText(current)
+        if ci >= 0: self.chamber.setCurrentIndex(ci)
+
+    def dump(self) -> dict:
+        d = {
+            "pin":       self.pin.currentText(),
+            "ttl_label": self.ttl_label.text().strip(),
+            "chamber":   self.chamber.currentText(),
+            "action":    self.action.currentText(),
+        }
+        port_ov = self.port_override.text().strip()
+        if port_ov:
+            d["arduino"] = {"port": port_ov}
+        return d
+
+
+class TTLMapTab(QWidget):
+    """
+    Global TTL map — a dynamic list of rows, each representing one
+    analog pin on the Arduino. Row order determines TTL channel number
+    (row 1 = TTL 1 = first entry in ANALOG_PINS in the sketch).
+
+    Actions available per row:
+        start_recording  — starts that chamber's camera recording
+        stop_recording   — stops it
+        log_event        — logs the pulse to CSV without changing recording state
+    """
+
+    def __init__(self, chambers_tab):
+        super().__init__()
+        self._chambers_tab = chambers_tab
+        self._rows: list[TTLMapRow] = []
+
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0)
+
+        # Global Arduino defaults
+        ard_box = QGroupBox("Global Arduino Defaults")
+        ard_lay = QGridLayout(ard_box); ard_lay.setSpacing(8)
+        ard_lay.setColumnStretch(1, 1); ard_lay.setColumnStretch(3, 1)
+
+        self.global_port = QLineEdit("COM3")
+        self.global_port.setPlaceholderText("default port for all entries")
+        self.global_baud = QComboBox()
+        for b in [9600,19200,38400,57600,115200,230400,460800,921600]:
+            self.global_baud.addItem(str(b), b)
+        self.global_baud.setCurrentText("115200")
+
+        self.scan_global = QPushButton("Scan ports")
+        self.scan_global.setFixedWidth(90)
+        self.scan_global.clicked.connect(self._scan_global)
+        self._scan_lbl = QLabel(""); self._scan_lbl.setObjectName("note")
+
+        port_row = QWidget(); pr = QHBoxLayout(port_row); pr.setContentsMargins(0,0,0,0)
+        pr.addWidget(self.global_port, 1); pr.addWidget(self.scan_global)
+
+        self.global_vref = QComboBox()
+        self.global_vref.addItem("5.0 V  (Uno / Mega / Nano)", 5.0)
+        self.global_vref.addItem("3.3 V  (Due / Zero / MKR)",  3.3)
+
+        ard_lay.addWidget(lbl("Default port"),    0, 0); ard_lay.addWidget(port_row,          0, 1, 1, 3)
+        ard_lay.addWidget(self._scan_lbl,         1, 0, 1, 4)
+        ard_lay.addWidget(lbl("Default baud"),    2, 0); ard_lay.addWidget(self.global_baud,  2, 1)
+        ard_lay.addWidget(lbl("Board voltage"),   2, 2); ard_lay.addWidget(self.global_vref,  2, 3)
+        ard_lay.addWidget(note(
+            "These apply to all TTL map rows that don't have a per-row port override. "
+            "Board voltage must also match BOARD_VREF in chamber_ttl_analog.ino."
+        ), 3, 0, 1, 4)
+        outer.addWidget(ard_box)
+
+        # Toolbar
+        tb = QWidget(); tl = QHBoxLayout(tb); tl.setContentsMargins(12, 6, 12, 2)
+        add_btn = QPushButton("+ Add TTL row")
+        add_btn.clicked.connect(lambda: self._add_row({}))
+        rem_btn = QPushButton("− Remove last row")
+        rem_btn.clicked.connect(self._remove_last_row)
+        tl.addWidget(add_btn); tl.addWidget(rem_btn); tl.addStretch()
+        tl.addWidget(note("Row order = TTL channel number (row 1 = TTL 1)"))
+        outer.addWidget(tb)
+
+        # Column header
+        hdr = QWidget()
+        hl  = QHBoxLayout(hdr); hl.setContentsMargins(12, 0, 12, 0); hl.setSpacing(6)
+        for txt, w in [("TTL#", 46), ("Pin", 68+28), ("Label", 130+40),
+                       ("Chamber", 120+55), ("Action", 148+46), ("Port override", 140+36)]:
+            lb = QLabel(txt); lb.setFixedWidth(w)
+            lb.setStyleSheet(f"color:#556060; font-size:10px;")
+            hl.addWidget(lb)
+        hl.addStretch()
+        outer.addWidget(hdr)
+
+        # Row container
+        self._row_widget = QWidget()
+        self._row_layout = QVBoxLayout(self._row_widget)
+        self._row_layout.setSpacing(2); self._row_layout.setContentsMargins(12, 4, 12, 12)
+        self._row_layout.addStretch()
+        outer.addWidget(scrollable(self._row_widget))
+
+    def _scan_global(self):
+        try:
+            import serial.tools.list_ports as lp
+            ports = list(lp.comports())
+            if ports:
+                self._scan_lbl.setText(
+                    "  " + "   ".join(f"{p.device}" for p in sorted(ports)))
+                if self.global_port.text() in ("COM3", "COM1", ""):
+                    self.global_port.setText(sorted(ports)[0].device)
+            else:
+                self._scan_lbl.setText("  No ports found.")
+        except ImportError:
+            self._scan_lbl.setText("  pip install pyserial")
+
+    def _chamber_keys(self) -> list[str]:
+        return self._chambers_tab.camera_keys() if hasattr(
+            self._chambers_tab, 'camera_keys') else []
+
+    def _add_row(self, cfg: dict):
+        row_num = len(self._rows) + 1
+        row     = TTLMapRow(cfg, self._chamber_keys(), row_num)
+        self._rows.append(row)
+        self._row_layout.insertWidget(self._row_layout.count() - 1, row)
+
+    def _remove_last_row(self):
+        if not self._rows:
+            return
+        row = self._rows.pop()
+        self._row_layout.removeWidget(row)
+        row.deleteLater()
+
+    def refresh_chambers(self):
+        """Called when the Chambers tab changes so dropdowns stay in sync."""
+        keys = self._chamber_keys()
+        for row in self._rows:
+            row.update_chambers(keys)
+
+    def load(self, ttl_map: list, arduino_cfg: dict):
+        # Clear existing rows
+        for row in self._rows:
+            self._row_layout.removeWidget(row)
+            row.deleteLater()
+        self._rows.clear()
+
+        # Load global arduino defaults
+        self.global_port.setText(arduino_cfg.get("port", "COM3"))
+        bi = self.global_baud.findText(str(arduino_cfg.get("baud", 115200)))
+        if bi >= 0: self.global_baud.setCurrentIndex(bi)
+        vref_val = arduino_cfg.get("vref", 5.0)
+        for i in range(self.global_vref.count()):
+            if abs(self.global_vref.itemData(i) - vref_val) < 0.01:
+                self.global_vref.setCurrentIndex(i); break
+
+        for entry in ttl_map:
+            self._add_row(entry)
+
+    def dump(self) -> tuple[list, dict]:
+        """Returns (ttl_map list, arduino global dict)."""
+        arduino_cfg = {
+            "port": self.global_port.text().strip(),
+            "baud": int(self.global_baud.currentText()),
+            "vref": self.global_vref.currentData(),
+        }
+        ttl_map = [row.dump() for row in self._rows]
+        return ttl_map, arduino_cfg
 
 
 # ---------------------------------------------------------------------------
@@ -427,14 +632,10 @@ class SingleChamberWidget(QWidget):
         top_g.addWidget(timer_note,              1,2,1,2)
         layout.addWidget(top_box)
 
-        # ---- Arduino connection ----
+        # ---- Arduino connection (port/baud/vref — pin→action mapping is in TTL Map tab) ----
         ard_cfg = cfg.get("arduino", {})
-        self.arduino_sig = ArduinoSigWidget(
-            "Arduino Connection",
-            ard_cfg,
-            chamber_key,
-        )
-        layout.addWidget(self.arduino_sig)
+        self.arduino_port = ArduinoPortWidget(ard_cfg)
+        layout.addWidget(self.arduino_port)
 
     def dump(self) -> dict:
         return {
@@ -442,7 +643,7 @@ class SingleChamberWidget(QWidget):
             "record":        self.record_chk.isChecked(),
             "timer_enabled": self.timer_enabled.isChecked(),
             "duration_s":    self.duration_spin.value(),
-            "arduino":       self.arduino_sig.dump(),
+            "arduino":       self.arduino_port.dump(),
         }
 
 
@@ -535,13 +736,28 @@ class RecordingTab(QWidget):
         ml = QVBoxLayout(mode_box)
         self.auto_start = QCheckBox("Auto-start recording when script launches")
         self.auto_start.setChecked(False)
+        self.preview_enabled = QCheckBox("Show live preview window during acquisition")
+        self.preview_enabled.setChecked(True)
+        self.preview_downsample = QSpinBox()
+        self.preview_downsample.setRange(1, 60)
+        self.preview_downsample.setSuffix("  (show every Nth frame)")
+        self.preview_downsample.setValue(1)
         ml.addWidget(self.auto_start)
+        ml.addWidget(self.preview_enabled)
+        prev_row = QWidget(); pr = QHBoxLayout(prev_row); pr.setContentsMargins(20,0,0,0)
+        pr.addWidget(lbl("Preview downsample")); pr.addWidget(self.preview_downsample); pr.addStretch()
+        ml.addWidget(prev_row)
         ml.addWidget(note(
             "Auto-start ON  → recording begins immediately on script launch for all\n"
             "                 chambers that have 'Record this chamber' enabled.\n"
             "Auto-start OFF → cameras stream to preview only; recording starts per-chamber\n"
             "                 via its TTL start pulse or manual start in the stats popup.\n"
-            "Per-chamber timer → configure inside each chamber card in the Chambers tab."
+            "Per-chamber timer → configure inside each chamber card in the Chambers tab.\n\n"
+            "Live preview here uses the SAME camera frames already being captured — it does "
+            "NOT open a second camera connection. Do not also run preview.py while this "
+            "script is running; both would try to open the same cameras and one will be "
+            "refused. Use preview.py only when acquisition is NOT running, to check framing "
+            "before starting an experiment."
         ))
         layout.addWidget(mode_box)
 
@@ -589,6 +805,9 @@ class RecordingTab(QWidget):
         self.save_dir.setText(config.get("save_dir","./recordings"))
         acq = config.get("acquisition",{})
         self.auto_start.setChecked(acq.get("auto_start",False))
+        prev = config.get("preview",{})
+        self.preview_enabled.setChecked(prev.get("enabled", True))
+        self.preview_downsample.setValue(prev.get("downsample", 1))
         rec = config.get("recording",{})
         self.fps.setValue(rec.get("fps",59.99))
         self.jpeg_quality.setValue(rec.get("jpeg_quality",90))
@@ -603,6 +822,10 @@ class RecordingTab(QWidget):
             "save_dir":   self.save_dir.text().strip() or "./recordings",
             "acquisition": {
                 "auto_start": self.auto_start.isChecked(),
+            },
+            "preview": {
+                "enabled":    self.preview_enabled.isChecked(),
+                "downsample": self.preview_downsample.value(),
             },
             "recording": {"fps": self.fps.value(), "jpeg_quality": self.jpeg_quality.value(),
                           "split_size_mb": None},
@@ -748,12 +971,14 @@ class ConfigEditor(QMainWindow):
         self.meta_tab      = MetadataTab()
         self.cameras_tab   = CamerasTab()
         self.chambers_tab  = ChambersTab(self.cameras_tab)
+        self.ttl_map_tab   = TTLMapTab(self.chambers_tab)
         self.recording_tab = RecordingTab()
         self.trigger_tab   = TriggerTab()
 
         self.tabs.addTab(self.meta_tab,      "🧪  Experiment")
         self.tabs.addTab(self.cameras_tab,   "📷  Cameras")
-        self.tabs.addTab(self.chambers_tab,  "🏠  Chambers & TTL")
+        self.tabs.addTab(self.chambers_tab,  "🏠  Chambers")
+        self.tabs.addTab(self.ttl_map_tab,   "🔌  TTL Map")
         self.tabs.addTab(self.recording_tab, "🎬  Recording / ROI")
         self.tabs.addTab(self.trigger_tab,   "⚡  Trigger / CSV")
         ml.addWidget(self.tabs, 1)
@@ -787,6 +1012,7 @@ class ConfigEditor(QMainWindow):
         self.meta_tab.load(data.get("experiment_metadata",{}))
         self.cameras_tab.load(data.get("cameras",{}))
         self.chambers_tab.load(data.get("chambers",{}))
+        self.ttl_map_tab.load(data.get("ttl_map", []), data.get("arduino", {}))
         self.recording_tab.load(data)
         self.trigger_tab.load(data)
 
@@ -797,11 +1023,15 @@ class ConfigEditor(QMainWindow):
     def _collect(self):
         rec  = self.recording_tab.dump()
         trig = self.trigger_tab.dump()
+        ttl_map, arduino_cfg = self.ttl_map_tab.dump()
         merged = dict(self._config_data)
         merged["save_dir"]            = rec.pop("save_dir")
         merged["acquisition"]         = rec["acquisition"]
+        merged["preview"]             = rec["preview"]
         merged["cameras"]             = self.cameras_tab.dump()
         merged["chambers"]            = self.chambers_tab.dump()
+        merged["ttl_map"]             = ttl_map
+        merged["arduino"]             = arduino_cfg
         merged["recording"]           = rec["recording"]
         merged["roi"]                 = rec["roi"]
         merged["trigger"]             = trig["trigger"]
