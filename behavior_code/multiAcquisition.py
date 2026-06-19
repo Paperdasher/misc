@@ -80,6 +80,7 @@ import shutil
 import time
 import argparse
 import csv
+import math
 from collections import deque
 from datetime import datetime
 
@@ -87,9 +88,6 @@ import numpy as np
 import yaml
 import cv2
 import PySpin
-
-from camera_lock import acquire_camera_lock, release_camera_lock, who_holds_lock
-from tiling import draw_error_tile, draw_tile_overlay, tile_frames
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +97,74 @@ from tiling import draw_error_tile, draw_tile_overlay, tile_frames
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+# ---------------------------------------------------------------------------
+# Inline preview helpers  (replaces tiling.py dependency)
+# ---------------------------------------------------------------------------
+
+def draw_tile_overlay(
+    bgr: np.ndarray,
+    label: str,
+    chamber: str,
+    fps: float,
+    total: int,
+    recording: bool = False,
+) -> np.ndarray:
+    """Burn a status overlay onto a BGR preview tile."""
+    out  = bgr.copy()
+    h, w = out.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    # Semi-transparent top banner
+    banner_h = 28
+    overlay  = out.copy()
+    cv2.rectangle(overlay, (0, 0), (w, banner_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, out, 0.45, 0, out)
+
+    rec_dot  = "● " if recording else "○ "
+    dot_col  = (0, 60, 220) if recording else (120, 120, 120)
+    cv2.putText(out, rec_dot, (6, 19), font, 0.52, dot_col, 1, cv2.LINE_AA)
+
+    title = f"{label}" + (f"  [{chamber}]" if chamber else "")
+    cv2.putText(out, title, (26, 19), font, 0.50, (220, 220, 220), 1, cv2.LINE_AA)
+
+    stats_str = f"FPS {fps:5.1f}   #{total:,}"
+    tw, _ = cv2.getTextSize(stats_str, font, 0.45, 1)[0], None
+    cv2.putText(out, stats_str, (w - tw[0] - 8, 18),
+                font, 0.45, (0, 210, 210), 1, cv2.LINE_AA)
+
+    return out
+
+
+def tile_frames(
+    frames: list,
+    canvas_w: int,
+    canvas_h: int,
+) -> np.ndarray:
+    """Arrange up to 4 BGR frames into a 2×2 (or 1×N) grid."""
+    n = len(frames)
+    if n == 0:
+        return np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    tw   = canvas_w // cols
+    th   = canvas_h // rows
+
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    for i, frame in enumerate(frames):
+        r, c = divmod(i, cols)
+        x0, y0 = c * tw, r * th
+        if frame.ndim == 2:
+            tile = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        else:
+            tile = frame
+
+        tile_resized = cv2.resize(tile, (tw, th), interpolation=cv2.INTER_LINEAR)
+        canvas[y0:y0 + th, x0:x0 + tw] = tile_resized
+
+    return canvas
 
 
 # ---------------------------------------------------------------------------
@@ -297,10 +363,6 @@ class CameraWriter:
         self.start_wall   = None
         self.end_wall     = None
 
-        # Buffered frames counter (read by stats popup)
-        self._buffered    = 0
-        self._buf_lock    = threading.Lock()
-
     @property
     def buffered_frames(self) -> int:
         return self._fq.qsize()
@@ -435,7 +497,6 @@ class CameraStreamer:
         }
         self.cam_names = list(self.cam_configs.keys())
         self.cameras: dict[str, PySpin.Camera] = {}
-        self._locked_serials: list[str] = []
 
         # Recording state — keyed by camera name
         self._recording: dict[str, bool]         = {n: False for n in self.cam_names}
@@ -456,9 +517,7 @@ class CameraStreamer:
         self._rec_start_times: dict[str, float] = {}
 
         # Live preview frames — populated by the capture thread regardless
-        # of recording state, so a tile window can show them even when idle.
-        # This does NOT open a second camera handle; it's the same frames
-        # already being captured for recording, just also cached for display.
+        # of recording state so the tile window can show them when idle.
         self._preview_frames = {n: None             for n in self.cam_names}
         self._preview_locks  = {n: threading.Lock() for n in self.cam_names}
 
@@ -855,40 +914,8 @@ class CameraStreamer:
             return False
         return True
 
-    def _claim_locks(self) -> bool:
-        """
-        Claim exclusive locks for every camera serial before Init().
-        If any camera is already held by a live preview.py or another
-        acquisition instance, refuse and report exactly which one.
-        """
-        ok = True
-        for name, cfg in self.cam_configs.items():
-            serial = cfg["serial"]
-            if acquire_camera_lock(serial, owner=f"multiAcquisition.py:{name}"):
-                self._locked_serials.append(serial)
-            else:
-                holder = who_holds_lock(serial)
-                print(f"[Acquisition] Camera '{name}' (serial {serial}) is "
-                     f"already in use by {holder}.")
-                print(f"              Close that process (e.g. preview.py) "
-                     f"before starting acquisition.")
-                ok = False
-        return ok
-
-    def _release_locks(self):
-        for serial in self._locked_serials:
-            release_camera_lock(serial)
-        self._locked_serials.clear()
-
     def _init_cameras(self):
-        if not self._claim_locks():
-            raise RuntimeError(
-                "One or more cameras are already in use by another process. "
-                "Spinnaker cameras can only be opened by one process at a time — "
-                "stop preview.py (or any other acquisition instance) first."
-            )
         if not self._find_cameras():
-            self._release_locks()
             raise RuntimeError("Not all cameras found.")
         for name, cam in self.cameras.items():
             cam.Init()
@@ -959,7 +986,6 @@ class CameraStreamer:
             except Exception:
                 pass
         self.cameras.clear()
-        self._release_locks()
 
 
 # ---------------------------------------------------------------------------
@@ -1102,7 +1128,6 @@ def _popup_mouse_cb(event, x, y, flags, param):
             print(f"[Popup] Manual STOP  → {ch_name}")
 
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1229,7 +1254,6 @@ def run_setup_wizard(system, output_path="config.yaml"):
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
     print(f"\nConfig → {os.path.abspath(output_path)}")
     print("Acquire:  python multiAcquisition.py -c config.yaml")
-    print("Preview:  python preview.py -c config.yaml")
     print("GUI:      python config.py -c config.yaml")
 
 
@@ -1329,10 +1353,6 @@ def main():
         "chamber_to_cam": streamer.chamber_to_cam,
     })
 
-    # Optional live preview tile window — same camera frames already being
-    # captured for recording, just also displayed. No second camera handle
-    # is opened, so this never conflicts with the lock or with preview.py
-    # (which should NOT be run at the same time as this script — see below).
     preview_enabled = config.get("preview", {}).get("enabled", True)
     PREVIEW_WIN = "Acquisition Preview"
     default_w, default_h = 1280, 720
@@ -1340,9 +1360,6 @@ def main():
     if preview_enabled:
         cv2.namedWindow(PREVIEW_WIN, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(PREVIEW_WIN, default_w, default_h)
-        print("Live preview window open (same frames being recorded — "
-             "do not also run preview.py while this script is running, "
-             "since both would try to open the same cameras).\n")
 
     try:
         while True:
