@@ -46,9 +46,6 @@ You will also need the Arduino IDE installed to flash `chamber_ttl_analog.ino` o
 |---|---|
 | `config.py` | GUI for creating and editing `.yaml` configuration files |
 | `multiAcquisition.py` | Main acquisition script — preview, recording, TTL handling, stats popup |
-| `preview.py` | Standalone preview-only script, for checking camera framing before an experiment without locking cameras for recording |
-| `camera_lock.py` | Shared module preventing two scripts from opening the same camera at once |
-| `tiling.py` | Shared module for the tiled multi-camera preview window |
 | `chamber_ttl_analog.ino` | Arduino sketch — reads analog TTL voltages and reports them over serial |
 | `requirements.txt` | Python package dependencies (excludes PySpin — see Installation) |
 
@@ -85,22 +82,6 @@ Once finished, save the configuration file (Save or Save As, top right). We reco
 
 ---
 
-### Live preview before recording
-
-Before starting an experiment, you can check camera framing and focus without touching the recording pipeline:
-
-```bash
-python preview.py -c <config file name>.yaml
-```
-
-This opens one resizable window tiling all enabled cameras: 1 camera fills the window, 2 cameras split left/right, 3 cameras use a left column plus a split right column, and 4 cameras form a 2x2 grid. Drag any corner of the window to resize — the tiling recalculates automatically. Each tile shows the camera's friendly name, mapped chamber, and live FPS.
-
-Press **ESC** or **Q** while the preview window is focused to close it.
-
-**Important:** `preview.py` and `multiAcquisition.py` should not run at the same time against the same cameras. A Spinnaker camera can only be opened by one process at a time. If you try to start `multiAcquisition.py` while `preview.py` still holds a camera (or vice versa), the second script will refuse to open that camera and print which process is holding it, rather than silently corrupting the video feed. Close `preview.py` before launching `multiAcquisition.py`, or simply skip `preview.py` entirely — `multiAcquisition.py` has its own live preview window built in (see below), so once acquisition is running you don't need `preview.py` again until your next setup check.
-
----
-
 ### Running acquisition
 
 ```bash
@@ -122,12 +103,7 @@ To stop the script entirely, press **ESC** while either window is focused, or Ct
 
 TTL detection uses the Arduino sketch `chamber_ttl_analog.ino`, which reads several analog input pins and reports their state over serial — it does **not** use digital pins or edge interrupts.
 
-**Channel numbering.** Each analog pin configured in the sketch's `ANALOG_PINS` array is assigned a sequential TTL channel number starting at 1, in array order. By convention each chamber uses 3 consecutive channels (one to start, one to stop, one spare), e.g.:
-
-- Chamber 1 -> pins A0, A1, A2 -> TTL 1, 2, 3
-- Chamber 2 -> pins A3, A4, A5 -> TTL 4, 5, 6
-
-This numbering is defined in the `.ino` file and must match the **Start TTL #** / **Stop TTL #** values set for each chamber in `config.py`'s Chambers tab.
+**Channel numbering.** UPDATE LATER
 
 **Threshold.** The sketch compares each pin's analog reading against a threshold derived from `BOARD_VREF` (the board's logic voltage — 5.0 for Uno/Mega/Nano, 3.3 for Due/Zero/MKR) and `THRESHOLD_FRACTION` (default 0.5, i.e. half of VREF). Both constants are set directly in `chamber_ttl_analog.ino` — open the file in the Arduino IDE, edit `BOARD_VREF` to match your board, and re-upload. The Board Voltage dropdown in `config.py` is informational only and does not change the sketch.
 
