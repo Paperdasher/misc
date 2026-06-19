@@ -1,50 +1,45 @@
 /*
   chamber_ttl_analog.ino
   =======================
-  Reads analog voltage on multiple pins and reports threshold-crossing
-  state for each pin to Python over USB serial as numbered TTL channels.
+  Reads analog voltage on multiple pins. When a pin's voltage crosses
+  the threshold and stays high long enough to be confirmed, the pin's
+  name (e.g. "A0") is sent once over USB serial. Nothing is sent while
+  voltage is below the threshold or during the debounce period.
 
-  TTL channel numbering
-  ---------------------
-  Channels are numbered sequentially starting at 1, in the same order as
-  ANALOG_PINS below:
-      ANALOG_PINS[0] → TTL 1
-      ANALOG_PINS[1] → TTL 2
-      ANALOG_PINS[2] → TTL 3
-      ...
+  The Python script (multiAcquisition.py) reads the received pin name
+  and looks it up directly in the ttl_map block of config.yaml to decide
+  which chamber to start/stop recording for.  No sequential numbering or
+  TTL channel concept exists here — the analog pin name IS the identifier.
 
-  IMPORTANT: The order of pins in ANALOG_PINS MUST match the order of
-  entries in the ttl_map list in config.yaml. The Python side assigns
-  each entry a TTL number by its position in that list (index + 1), and
-  uses that number to look up which chamber/action to trigger. This
-  sketch only reports raw per-pin state — all chamber assignment and
-  start/stop logic lives in config.yaml under ttl_map.
+  Pin → config.yaml correspondence
+  ---------------------------------
+  Each pin in ANALOG_PINS must have a matching entry in config.yaml's
+  ttl_map list with that same pin name:
 
-  Example: if config.yaml ttl_map reads
-      ttl_map:
-        - { pin: A0, chamber: chamber_A, action: start_recording, ... }  # → TTL 1
-        - { pin: A1, chamber: chamber_A, action: stop_recording,  ... }  # → TTL 2
-        - { pin: A2, chamber: chamber_A, action: log_event,       ... }  # → TTL 3
-        - { pin: A3, chamber: chamber_B, action: start_recording, ... }  # → TTL 4
-        - { pin: A4, chamber: chamber_B, action: stop_recording,  ... }  # → TTL 5
-        - { pin: A5, chamber: chamber_B, action: log_event,       ... }  # → TTL 6
-  then ANALOG_PINS must be { A0, A1, A2, A3, A4, A5 } in that exact order.
+      ANALOG_PINS entry   serial output   ttl_map "pin:" field
+      A0                  "A0\n"          pin: A0
+      A3                  "A3\n"          pin: A3
 
-  To add or rearrange channels: update ttl_map in config.yaml first,
-  then update ANALOG_PINS here to match. The sketch does not need to be
-  aware of chambers, actions, or any other semantic — only pin order
-  must stay in sync.
+  Only pins that are listed in ANALOG_PINS are monitored. Order within
+  ANALOG_PINS does not matter to the Python side — the pin name is the
+  key, not the array position.
+
+  Debounce
+  --------
+  A single high reading is not trusted — analog signals near the threshold
+  can bounce.  CONFIRM_COUNT consecutive high readings (at the loop polling
+  rate) are required before the pin name is sent.  Once sent, the pin is
+  marked as fired and will not send again until the voltage drops back
+  below the threshold, clearing the fired flag.
 
   Serial protocol
   ---------------
-  Every loop iteration, for EVERY configured pin, send:
-      TTL:<number>:<state>\n
-  where <state> is 1 (voltage above threshold) or 0 (below).
+  On confirmed HIGH:   send "<pin_name>\n"  (e.g. "A0\n", "A3\n")
+  On LOW / debounce:   send nothing
 
-  All pins are reported every loop regardless of state change. This lets
-  the Python AnalogTTLListener apply its own "3 consecutive active reads"
-  debounce/confirmation before acting — the decision logic stays on the
-  Python side.
+  This replaces the previous "TTL:<number>:<state>\n" protocol that sent
+  all pin states on every loop. The new protocol only transmits on events,
+  reducing serial traffic and moving all decision logic to config.yaml.
 
   Voltage threshold & board reference voltage
   -------------------------------------------
@@ -52,8 +47,8 @@
       5.0 → Uno, Mega, Nano  (5 V boards)
       3.3 → Due, Zero, MKR, and most 3.3 V boards
   THRESHOLD_FRACTION (default 0.5) sets the trigger point as a fraction
-  of VREF, so the threshold is automatically VREF / 2. Adjust if your
-  TTL source's "high" level sits closer to one rail.
+  of VREF, so the threshold is VREF / 2.  Adjust if your TTL source's
+  "high" level sits closer to one rail than the other.
 
   Wiring
   ------
@@ -71,7 +66,13 @@
 
 #define BAUD_RATE 115200
 
-// Board reference voltage — CHANGE THIS to match your hardware
+// Number of consecutive high readings required before firing.
+// At the default ~10 ms loop time (5 ms delay + ~5 ms serial), 3 reads
+// means the signal must stay high for ~30 ms before it is confirmed.
+// Raise this if you see false triggers; lower it if real triggers are missed.
+#define CONFIRM_COUNT 3
+
+// Board reference voltage — CHANGE THIS to match your hardware.
 //   5.0 for Uno/Mega/Nano,  3.3 for Due/Zero/MKR
 const float BOARD_VREF = 5.0;
 
@@ -84,26 +85,36 @@ const float THRESHOLD_FRACTION = 0.5;
 const int ADC_MAX = 1023;
 
 // ---------------------------------------------------------------------------
-// Analog pin list — MUST match the pin order in ttl_map in config.yaml
+// Pin list — MUST stay in sync with PIN_NAMES below
 //
-// Each entry here becomes the TTL channel with that 1-based index:
-//   ANALOG_PINS[0] → TTL 1  (must be the pin listed in ttl_map entry 0)
-//   ANALOG_PINS[1] → TTL 2  (must be the pin listed in ttl_map entry 1)
-//   ...
-//
-// Add, remove, or reorder pins here whenever you change ttl_map.
+// Add, remove, or reorder pins here to match what is physically wired.
+// The Python side does not care about order — it matches by pin name.
 // ---------------------------------------------------------------------------
 
 const uint8_t ANALOG_PINS[] = {
-  A0,   // TTL 1 — set action in ttl_map entry 0
-  A1,   // TTL 2 — set action in ttl_map entry 1
-  A2,   // TTL 3 — set action in ttl_map entry 2
-  A3,   // TTL 4 — set action in ttl_map entry 3
-  A4,   // TTL 5 — set action in ttl_map entry 4
-  A5,   // TTL 6 — set action in ttl_map entry 5
-  // A6,   // TTL 7 — uncomment and add matching ttl_map entry
-  // A7,   // TTL 8
-  // A8,   // TTL 9
+  A0,   // matched by PIN_NAMES[0] = "A0"
+  A1,   // matched by PIN_NAMES[1] = "A1"
+  A2,   // matched by PIN_NAMES[2] = "A2"
+  A3,   // matched by PIN_NAMES[3] = "A3"
+  A4,   // matched by PIN_NAMES[4] = "A4"
+  A5,   // matched by PIN_NAMES[5] = "A5"
+  // A6,   // uncomment and add "A6" to PIN_NAMES to enable
+  // A7,
+  // A8,
+};
+
+// Human-readable pin names sent over serial.
+// MUST have the same number of entries and the same order as ANALOG_PINS.
+const char* const PIN_NAMES[] = {
+  "A0",
+  "A1",
+  "A2",
+  "A3",
+  "A4",
+  "A5",
+  // "A6",
+  // "A7",
+  // "A8",
 };
 
 const uint8_t N_PINS = sizeof(ANALOG_PINS) / sizeof(ANALOG_PINS[0]);
@@ -115,35 +126,68 @@ const uint8_t N_PINS = sizeof(ANALOG_PINS) / sizeof(ANALOG_PINS[0]);
 const int THRESHOLD_RAW = (int)(ADC_MAX * THRESHOLD_FRACTION);
 
 // ---------------------------------------------------------------------------
+// Per-pin debounce state — allocated to a safe maximum
+// ---------------------------------------------------------------------------
+
+// Maximum number of pins this sketch supports without recompiling.
+// Only the first N_PINS entries are used.
+#define MAX_PINS 16
+
+// How many consecutive high readings have been seen for each pin.
+// Reset to 0 when the pin reads low.
+uint8_t consec[MAX_PINS];
+
+// True once a pin has fired for a sustained high period.
+// Prevents re-sending on every subsequent high reading while voltage stays up.
+// Reset to false when the pin reads low so the next rise can fire again.
+bool fired[MAX_PINS];
+
+// ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
 
 void setup() {
+  // Initialise debounce state arrays to zero / false.
+  memset(consec, 0, sizeof(consec));
+  memset(fired,  0, sizeof(fired));
+
   Serial.begin(BAUD_RATE);
+  // "READY" is sent once at startup so the Python listener knows the port
+  // is open and the sketch is running.  The listener ignores this line.
   Serial.println("READY");
 }
 
 // ---------------------------------------------------------------------------
-// Loop — report state of every pin every iteration
+// Loop — check each pin and send its name once on confirmed HIGH
 // ---------------------------------------------------------------------------
 
 void loop() {
   for (uint8_t i = 0; i < N_PINS; i++) {
-    int raw        = analogRead(ANALOG_PINS[i]);
-    int state      = (raw >= THRESHOLD_RAW) ? 1 : 0;
-    int ttl_number = i + 1;   // 1-based, matches ttl_map list index + 1
+    int raw = analogRead(ANALOG_PINS[i]);
 
-    Serial.print("TTL:");
-    Serial.print(ttl_number);
-    Serial.print(":");
-    Serial.println(state);
+    if (raw >= THRESHOLD_RAW) {
+      // Voltage is above threshold — increment the consecutive-high counter.
+      if (consec[i] < 255) consec[i]++;   // cap to avoid uint8_t overflow
+
+      // Fire only when the confirmation count is reached AND we have not
+      // already fired for this sustained high period.
+      if (consec[i] >= CONFIRM_COUNT && !fired[i]) {
+        Serial.println(PIN_NAMES[i]);   // e.g. "A0\n"
+        fired[i] = true;
+      }
+      // If already fired, do nothing — the pin stays silent until it goes low.
+
+    } else {
+      // Voltage dropped below threshold — reset both counters so the next
+      // sustained rise can fire again independently.
+      consec[i] = 0;
+      fired[i]  = false;
+    }
   }
 
-  // Small delay to set the polling rate.
-  // At 115200 baud each line is ~1 ms to transmit; 6 pins → ~6 ms per cycle.
-  // 5 ms extra gives ~10 ms total cycle time (~100 Hz per pin), which comfortably
-  // satisfies the 3-consecutive-reads debounce on the Python side.
-  // Reduce this if you need faster response; increase if the serial buffer
-  // overflows on boards with many pins.
+  // Delay sets the polling rate per pin.
+  // At 115200 baud, "A0\n" is ~3 bytes ≈ 0.26 ms; delay(5) gives ~5 ms per
+  // full cycle across all pins, putting debounce confirmation at ~15 ms
+  // (3 reads × 5 ms).  Reduce for faster response; raise if pins are noisy.
   delay(5);
 }
